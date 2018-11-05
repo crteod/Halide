@@ -33,6 +33,8 @@ namespace Internal {
 
 using namespace AutoScheduleModel;
 
+int my_debug = 1;
+
 namespace {
 
 using std::string;
@@ -2839,8 +2841,10 @@ struct State {
                     const auto &s = n.stages[stage_idx - 1];
                     if (!features.contains(&s)) break;
                     const auto &sched_feat = features.get(&s);
+                    debug(0) << "\n";
                     debug(0) << "YYY ";
                     debug(0) << n.func.name() << ' ' << (stage_idx - 1) << ' ';
+                    debug(0) << "\n";
                     const int64_t *sched_stats = (const int64_t *)(&sched_feat);
                     for (size_t i = 0; i < sizeof(ScheduleFeatures) / sizeof(int64_t); i++) {
                         // The schedule-based features are all
@@ -2850,6 +2854,7 @@ struct State {
                         debug(0) << std::log(1 + sched_stats[i]) << ' ';
                     }
                     const int *stats = (const int *)(&s.features);
+                    debug(0) << "\n";
                     for (size_t i = 0; i < sizeof(s.features) / sizeof(int); i++) {
                         debug(0) << stats[i] << ' ';
                     }
@@ -3087,6 +3092,7 @@ struct State {
                            const MachineParams &params,
                            ThroughputPredictorPipeline *throughput_predictor,
                            std::function<void(IntrusivePtr<State> &&)> &accept_child) const {
+        debug(0) << "\n(----- generate_children called -----)\n";
         internal_assert(root.defined() && root->is_root());
 
         if (num_funcs_scheduled == (int)dag.nodes.size()) {
@@ -3276,6 +3282,10 @@ public:
         std::pop_heap(storage.begin(), storage.begin() + sz, CompareStates{});
         sz--;
         return std::move(storage[sz]);
+    }
+
+    const std::vector<IntrusivePtr<State>> &get_storage() {
+        return storage;
     }
 
     const IntrusivePtr<State> &top() {
@@ -3511,6 +3521,134 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
     }
 }
 
+IntrusivePtr<State> optimal_schedule_pass_manual(FunctionDAG &dag,
+                                          vector<Function> outputs,
+                                          const MachineParams &params,
+                                          ThroughputPredictorPipeline *throughput_predictor,
+                                          int beam_size,
+                                          int pass_idx,
+                                          std::unordered_set<uint64_t> &permitted_hashes) {
+
+    if (throughput_predictor) {
+        configure_pipeline_features(dag, throughput_predictor);
+    }
+
+    StateQueue q, pending;
+
+    {
+        IntrusivePtr<State> initial{new State};
+        initial->root = new LoopNest;
+        q.emplace(std::move(initial));
+    }
+
+    // A progress bar.
+    uint32_t counter = 0;
+    auto tick = [&](double progress) {
+        counter++;
+        const int bits = 11;
+        if (counter & ((1 << bits) - 1)) return;
+        progress *= 78;
+        debug(0) << '[';
+        for (int j = 0; j < 78; j++) {
+            if (j < progress) {
+                debug(0) << '.';
+            } else if (j - 1 < progress) {
+                debug(0) << "/-\\|"[(counter >> bits) % 4];
+            } else {
+                debug(0) << ' ';
+            }
+        }
+        debug(0) << ']';
+        for (int j = 0; j < 80; j++) {
+            debug(0) << '\b';
+        }
+    };
+
+    int expanded;
+
+    std::function<void(IntrusivePtr<State> &&)> enqueue_new_children =
+        [&](IntrusivePtr<State> &&s) {
+
+        // debug(0) << "\n** Generated child: ";
+        // s->dump();
+        // s->calculate_cost(dag, params, nullptr, true);
+
+        internal_assert(s->num_funcs_scheduled == s->parent->num_funcs_scheduled + 1);
+
+        int progress = s->num_funcs_scheduled * beam_size + expanded;
+        size_t max_progress = dag.nodes.size() * beam_size;
+        tick(double(progress) / max_progress);
+        s->penalized = false;
+
+        q.emplace(std::move(s));
+    };
+
+    for (int level = 0; ; level++) {
+        std::unordered_map<uint64_t, int> hashes;
+        q.swap(pending);
+
+        internal_assert(!pending.empty());
+
+        const bool selection_required = pending.size() > 1;
+
+        if ((int)pending.size() > beam_size * 10000) {
+            debug(0) << "Huge number of states generated. Bailing out:\n";
+            // Wat?
+            while (!pending.empty()) {
+                pending.pop()->dump();
+            }
+        }
+
+        string select_message = selection_required ? "] Select a partial schedule:\n" : "] Selecting the only partial schedule:\n";
+        debug(0) << "\n--------------------\n";
+        debug(0) << "\n[Level " << level << ", beam_size = " << beam_size << select_message;
+
+        for (int i_pending = 0; (i_pending <= beam_size) && (i_pending < (int)pending.size()); ++i_pending) {
+
+            IntrusivePtr<State> state {pending.get_storage()[i_pending]};
+
+            if (selection_required) {
+                debug(0) << "\n[" << i_pending << "]:\n";
+                state->dump();
+                if (i_pending == beam_size) {
+                    debug(0) << "\nStopping at option beam_size = " << beam_size << ".\n";
+                }
+            } else {
+                state->dump();
+            }
+        }
+
+        int selection = 0;
+
+        if (selection_required) {
+            debug(0) << "\nEnter selection: ";
+            std::cin >> selection;
+        }
+
+        IntrusivePtr<State> state_selected {std::move(pending.get_storage()[selection])};
+
+        if (selection_required) {
+            debug(0) << "\nOption selected: [" << selection << "]\n";
+            state_selected->dump();
+        }
+
+        if (state_selected->num_funcs_scheduled == (int)dag.nodes.size()) {
+            return state_selected;
+        }
+
+        state_selected->generate_children(dag, params, throughput_predictor, enqueue_new_children);
+
+        // Drop the other states unconsidered.
+        pending.clear();
+
+        if (throughput_predictor) {
+            // Now evaluate all the costs and re-sort them in the priority queue
+            throughput_predictor->evaluate_costs();
+            q.resort();
+        }
+    }
+}
+
 IntrusivePtr<State> optimal_schedule(FunctionDAG &dag,
                                      vector<Function> outputs,
                                      const MachineParams &params,
@@ -3520,11 +3658,14 @@ IntrusivePtr<State> optimal_schedule(FunctionDAG &dag,
     IntrusivePtr<State> best;
 
     std::unordered_set<uint64_t> permitted_hashes;
-    int num_passes = (beam_size == 1) ? 1 : 5;
+    //int num_passes = (beam_size == 1) ? 1 : 5;
+    int num_passes = 1;
     for (int i = 0; i < num_passes; i++) {
-        auto pass = optimal_schedule_pass(dag, outputs, params, throughput_predictor, beam_size, i, permitted_hashes);
+        auto pass = optimal_schedule_pass_manual(dag, outputs, params, throughput_predictor, beam_size, i, permitted_hashes);
+        debug(0) << "\n--------------------\n";
         debug(0) << "\nPass " << i << " result:\n";
         pass->dump();
+        debug(0) << "\n--------------------\n";
 
         if (i == 0 || pass->cost < best->cost) {
             best = pass;
@@ -3855,7 +3996,7 @@ void autoschedule_test() {
     // test_convnet_correctness();
 
     MachineParams params(16, 16 * 1024 * 1024, 40);
-    size_t beam_size = 1;
+    //size_t beam_size = 1;
     // Use a fixed target for the analysis to get consistent results from this test.
     Target target("x86-64-linux-sse41-avx-avx2");
 
@@ -3879,19 +4020,30 @@ void autoschedule_test() {
         vector<Function> outputs = {h.function()};
         FunctionDAG dag(outputs, params, target);
 
+        debug(my_debug) << "!!!!! 1 !!!!!\n";
+
         auto optimal = optimal_schedule(dag, outputs, params, tpp, 8); //beam_size);
+
+        debug(my_debug) << "!!!!! 2 !!!!!\n";
 
         debug(0) << "** Optimal schedule:\n";
         optimal->calculate_cost(dag, params, tpp, true);
+        debug(0) << '\n';
+        debug(my_debug) << "!!!!! 3 !!!!!\n";
         if (tpp) tpp->evaluate_costs();
+        debug(my_debug) << "!!!!! 4 !!!!!\n";
+        debug(0) << '\n';
         optimal->dump();
         debug(0) << '\n';
+        debug(my_debug) << "!!!!! 5 !!!!!\n";
 
         optimal->apply_schedule(params);
+        debug(my_debug) << "!!!!! 6 !!!!!\n";
         // h.realize(1000, 1000);
 
     }
 
+    /*
     if (1) {
         // In a pipeline with huge expensive stencils and low memory costs, nothing should be fused
         Func f("f"), g("g"), h("h");
@@ -4279,6 +4431,7 @@ void autoschedule_test() {
         f[N-1].estimate(x, 0, 2048).estimate(y, 0, 2048);
         generate_schedules_autotune({f[N-1].function()}, target, params);
     }
+     */
 }
 
 }
