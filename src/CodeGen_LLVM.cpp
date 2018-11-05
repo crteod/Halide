@@ -550,7 +550,6 @@ std::unique_ptr<llvm::Module> CodeGen_LLVM::compile(const Module &input) {
     device_interface_t_type = module->getTypeByName("struct.halide_device_interface_t");
     internal_assert(scalar_value_t_type) << "Did not find halide_device_interface_t in initial module";
 
-
     pseudostack_slot_t_type = module->getTypeByName("struct.halide_pseudostack_slot_t");
     internal_assert(scalar_value_t_type) << "Did not find halide_pseudostack_slot_t in initial module";
 
@@ -596,6 +595,11 @@ std::unique_ptr<llvm::Module> CodeGen_LLVM::compile(const Module &input) {
 
     // Optimize
     CodeGen_LLVM::optimize_module();
+
+    if (target.has_feature(Target::EmbedBitcode)) {
+        std::string halide_command = "halide target=" + target.to_string();
+        embed_bitcode(module.get(), halide_command);
+    }
 
     input_module = nullptr;
 

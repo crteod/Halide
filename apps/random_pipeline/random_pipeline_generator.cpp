@@ -26,7 +26,7 @@ float rand_float() { return rand_int(0, 1 << 30) / (float)(1 << 30); }
 
 Expr rand_value(Type t) {
     if (t.is_int()) {
-        return cast(t, rand_int(-128, 127));
+        return cast(t, rand_int(1, 127));
     } else if (t.is_float()) {
         return cast(t, rand_float());
     } else {
@@ -152,7 +152,7 @@ public:
 
     // 50% chance of returning a pooling stage 50% chance returning 2D convolution
     Stage convolve_or_pool(Stage f, int kernel_min, int kernel_max) {
-        if (rand_bool() && f.may_reduce_size()) {
+        if (rand_bool() && f.may_reduce_size() && f.w >= 32 && f.h >= 32) {
             int pool_type = rand_int(0,2);
             if (pool_type == 0) return pool2D(f);
             if (pool_type == 1) return pool2D_w(f);
@@ -171,7 +171,7 @@ public:
         vector<Var> args = f.func.args();
         Func pooled2D("pooled2D" + args[0].name() + args[1].name());
 
-        int factor = std::ceil(std::sqrt(f.random_size_reduce_factor()));
+        int factor = 2;
         int min = -(factor+1)/2;
         int extent = min + factor + 1;
         int scale = extent * extent;
@@ -202,7 +202,7 @@ public:
         vector<Var> args = f.func.args();
         Func pooled2D_r("pool2D_r_" + args[0].name() + args[1].name());
 
-        int factor = std::ceil(std::sqrt(f.random_size_reduce_factor()));
+        int factor = 2;
         int min = -(factor+1)/2;
         int extent = min + factor + 1;
         int scale = extent * extent;
@@ -223,7 +223,7 @@ public:
         vector<Var> args = f.func.args();
         Func pooled2D_w("pooled2D_w_" + args[0].name() + args[1].name());
 
-        int factor = std::ceil(std::sqrt(f.random_size_reduce_factor()));
+        int factor = 2;
         int min = -(factor+1)/2;
         int extent = min + factor + 1;
         int scale = extent * extent;
@@ -288,7 +288,7 @@ public:
         coords[0] += r.x;
         coords[1] += r.y;
         coords[2] = r.z;
-        conv(args) += rand_value(f.func.value().type()) * f.func(coords);
+        conv(args) += rand_value(f.func.value().type()) * (args[2] + 1) * f.func(coords);
 
         return {conv, f.w, f.h, f.random_out_channels()};
     }
@@ -310,7 +310,11 @@ public:
         coords[0] += r.x;
         coords[1] += r.y;
         coords[2] = r.z;
-        conv(args) = sum(rand_value(f.func.value().type()) * f.func(coords));
+        // sum() captures free vars in the order found, and the new
+        // autoscheduler isn't clever enough to do storage reordering
+        // yet, so make sure to put the term that depends on the
+        // output channel last.
+        conv(args) = sum(rand_value(f.func.value().type()) * f.func(coords) * (args[2] + 1));
 
         // choose a channel output size - 0.5 prob of doubling channel dim
         return {conv, f.w, f.h, f.random_out_channels()};
@@ -507,6 +511,7 @@ public:
 
     // Transpose
     Stage transpose(Stage f) {
+        std::cout << "Transpose\n";
         Func transpose("transpose");
         vector<Expr> coords = make_arguments(f.func.args());
         vector<Expr> swizzled_coords = coords;
@@ -518,6 +523,7 @@ public:
     }
 
     Stage slice(Stage f, Stage g) {
+        std::cout << "Slice\n";
         if (f.c > g.c) {
             std::swap(f, g);
         }
@@ -536,11 +542,12 @@ public:
 
     Stage tiled_histogram(Stage f) {
         // Make a histogram of NxN patches of f, preserving total size
+        std::cout << "Tiled histogram\n";
 
         int old_c = f.c;
         f = resample_to(f, f.w, f.h, 1);
 
-        int box_size = rand_int(2, 8);
+        int box_size = 1 << rand_int(1, 3);
         int histogram_buckets = box_size * box_size * old_c;
 
         RDom r(0, box_size, 0, box_size);
@@ -563,10 +570,16 @@ public:
         Stage out = f;
         // First decrease any sizes that need decreasing
         if (out.w > w) {
-            out = downsample(out, 0, out.w / w);
+            int factor = (out.w + w/2) / w;
+            if (factor != 1) {
+                out = downsample(out, 0, factor);
+            }
         }
         if (out.h > h) {
-            out = downsample(out, 1, out.h / h);
+            int factor = (out.h + h/2) / h;
+            if (factor != 1) {
+                out = downsample(out, 1, (out.h + h/2) / h);
+            }
         }
         // Adapt channel count with an all-to-all
         if (out.c != c) {
@@ -575,10 +588,16 @@ public:
         }
         // Increase any sizes that need increasing
         if (out.w < w) {
-            out = upsample(out, 0, (w + out.w - 1) / out.w);
+            int factor = (w + out.w/2) / out.w;
+            if (factor != 1) {
+                out = upsample(out, 0, factor);
+            }
         }
         if (out.h < h) {
-            out = upsample(out, 1, (h + out.h - 1) / out.h);
+            int factor = (h + out.h/2) / out.h;
+            if (factor != 1) {
+                out = upsample(out, 1, factor);
+            }
         }
         std::cout << "Resulting size: " << out.w << ", " << out.h << ", " << out.c << "\n";
         return out;
@@ -633,7 +652,7 @@ public:
             return transpose(f);
         } else if (stage_type == 18 && f.size() < 10000) {
             return unary_op(f);
-        } else if (stage_type == 19 && f.w > 16 && f.h > 16) {
+        } else if (stage_type == 19 && f.w > 32 && f.h > 32) {
             return tiled_histogram(f);
         } else if (stage_type == 20) {
             return slice(f, g);

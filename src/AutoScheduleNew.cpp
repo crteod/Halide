@@ -10,6 +10,7 @@
 #include "RealizationOrder.h"
 #include "Simplify.h"
 #include "Substitute.h"
+#include "ThreadPool.h"
 #include "Util.h"
 #include "PartitionLoops.h"
 #include "../tools/halide_benchmark.h"
@@ -57,10 +58,14 @@ uint64_t get_dropout_threshold() {
     }
 }
 
+static uint64_t random_dropout_threshold = 100;
+
 bool random_dropout() {
-    static uint64_t threshold = get_dropout_threshold();
+    static bool init =
+        []() {random_dropout_threshold = get_dropout_threshold(); return true;}();
+    (void)init;
     uint64_t r = rand();
-    bool drop_it = (r % 100) >= threshold;
+    bool drop_it = (r % 100) >= random_dropout_threshold;
     return drop_it;
 }
 
@@ -1332,7 +1337,7 @@ vector<vector<int64_t>> generate_tilings(const vector<int64_t> &s, int d, int fa
                     int inner = (s[d] + outer - 1) / outer;
                     if (is_one && outer == 1) continue;
                     if (is_full && outer == s[d]) continue;
-                    if (outer > inner || (d == vector_dim && inner < vector_size)) break;
+                    if (outer > inner || (d == vector_dim && outer > inner/vector_size)) break;
                     t.back() = outer;
                     result.push_back(t);
                 }
@@ -1382,8 +1387,8 @@ struct ScheduleFeatures {
     int64_t inlined_calls = 0; // For inlined Funcs, how many calls are made to this Func total
 
     // Logically these features should be grouped earlier, but the convnet currently doesn't know about them
-    int64_t bytes_read_per_realization = 0; // Number of bytes loaded from all inputs per production
-    int64_t lines_read_per_realization = 0; // Number of contiguous segments of memory loaded from all inputs per production
+    int64_t unique_bytes_read_per_realization = 0; // Number of unique bytes loaded from all inputs per production
+    int64_t unique_lines_read_per_realization = 0; // Number of unique contiguous segments of memory loaded from all inputs per production
     int64_t allocation_bytes_read_per_realization = 0; // The sum of the sizes of the allocations accessed per production. Gives a hint as to the likely locality of it.
 
     int64_t working_set = 0; // The sum of the sizes of the allocations within the production of this Func. Probably a good thing if it fits in cache.
@@ -1393,6 +1398,8 @@ struct ScheduleFeatures {
     int64_t rounded_innermost_pure_loop_extent = 0; // Innermost pure loop extend rounded up to the next multiple of the vector size
 
     int native_vector_size = 0; // The native vector size for the narrowest type used.
+
+    int64_t non_unique_bytes_read_per_realization = 0; // Number of bytes read per realization, counting reloads of the same memory.
 
     void dump() const {
         debug(0) << "    num_realizations:                      " << num_realizations << '\n'
@@ -1413,13 +1420,14 @@ struct ScheduleFeatures {
                  << "    innermost_bytes_at_root:               " << innermost_bytes_at_root << '\n'
                  << "    bytes_read_per_tile:                   " << bytes_read_per_tile << '\n'
                  << "    inlined_calls:                         " << inlined_calls << '\n'
-                 << "    bytes_read_per_realization:            " << bytes_read_per_realization << '\n'
-                 << "    lines_read_per_realization:            " << lines_read_per_realization << '\n'
+                 << "    unique_bytes_read_per_realization:     " << unique_bytes_read_per_realization << '\n'
+                 << "    unique_lines_read_per_realization:     " << unique_lines_read_per_realization << '\n'
                  << "    allocation_bytes_read_per_realization: " << allocation_bytes_read_per_realization << '\n'
                  << "    working_set:                           " << working_set << '\n'
                  << "    vector_size:                           " << vector_size << '\n'
                  << "    rounded_innermost_pure_loop_extent     " << rounded_innermost_pure_loop_extent << '\n'
-                 << "    native_vector_size:                    " << vector_size << '\n';
+                 << "    native_vector_size:                    " << vector_size << '\n'
+                 << "    non_unique_bytes_read_per_realization: " << non_unique_bytes_read_per_realization << '\n';
     }
 };
 
@@ -1954,6 +1962,12 @@ struct LoopNest {
                     innermost_storage_extent = bounds->region_computed(0).second - bounds->region_computed(0).first + 1;
                 }
                 feat.innermost_bytes_at_realization = node->bytes_per_point * innermost_storage_extent;
+
+                int64_t bytes_read_per_point = 0;
+                for (const auto *e : node->incoming_edges) {
+                    bytes_read_per_point += e->calls * e->producer->bytes_per_point;
+                }
+                feat.non_unique_bytes_read_per_realization = bytes_read_per_point * feat.points_computed_per_realization;
             }
         }
 
@@ -2147,15 +2161,18 @@ struct LoopNest {
         }
 
         if (at_production) {
-            feat.bytes_read_per_realization = bytes_loaded;
+            // Properties of the realization, but the values are
+            // computable at the production site because that's where
+            // the consumers are.
+            feat.unique_bytes_read_per_realization = bytes_loaded;
             feat.allocation_bytes_read_per_realization = allocation_bytes_loaded;
-            feat.lines_read_per_realization = lines_loaded;
+            feat.unique_lines_read_per_realization = lines_loaded;
 
             if (!at_pure_production) {
                 // Also pessimistically assume this update definition relies on the entirety of the produced region so far.
                 // TODO: This overbills scatters, or writes to a restriction region.
-                feat.bytes_read_per_realization += feat.bytes_at_production;
-                feat.lines_read_per_realization++; // It's accessed contiguously
+                feat.unique_bytes_read_per_realization += feat.bytes_at_production;
+                feat.unique_lines_read_per_realization++; // It's accessed contiguously (TODO: This is fishy. Should probably be lines_at_production)
                 feat.allocation_bytes_read_per_realization += feat.bytes_at_production;
             }
         }
@@ -2403,14 +2420,18 @@ struct LoopNest {
             }
         }
 
-        int vector_size = is_root() ? 1 : stage->vector_size;
+        const int vector_size = is_root() ? 1 : stage->vector_size;
         int vector_dim = 0;
         if (!is_root()) {
             const auto &l = stage->loop;
             while (vector_dim < (int)l.size() && !l[vector_dim].pure) vector_dim++;
         }
 
-        if (!innermost &&
+        // HACK (when true)
+        const bool force_only_output_compute_root = false;
+
+        if ((!is_root() || f->is_output || !force_only_output_compute_root) &&
+            !innermost &&
             (!in_realization || size[vector_dim] == 1)) {
             // Place the computation inside this loop
             std::unique_ptr<LoopNest> r{new LoopNest};
@@ -2609,7 +2630,7 @@ struct LoopNest {
                     const auto &p = parent_bounds->loops(stage_idx, i);
                     fv.extent = p.second - p.first + 1;
                     fv.outermost = true;
-                    fv.parallel = false;
+                    fv.parallel = parent->is_root() && l.pure;
                     fv.exists = true;
                     vars.vars.push_back(fv);
                 }
@@ -2639,21 +2660,23 @@ struct LoopNest {
                 }
             }
 
-            // Pick a tail strategy for any splits
-            auto tail_strategy = TailStrategy::Auto;
-            if (stage_idx == 0 && !accesses_input_buffer() && !node->is_output) {
+            // Pick a tail strategy for any splits of pure vars. RVars always use guardwithif
+            auto pure_var_tail_strategy = TailStrategy::Auto;
+            if (!accesses_input_buffer() && !node->is_output) {
                 // Roundup is lowest overhead, provided it doesn't
                 // expand the bounds read on the input or written on
                 // the output. However, you can only really use it on
                 // pure stages that don't access the input anywhere in
                 // their loop nest.
-                tail_strategy = TailStrategy::RoundUp;
-            } else if (stage_idx > 0) {
-                // update stages use guardwithif
-                tail_strategy = TailStrategy::GuardWithIf;
-            } else {
+                pure_var_tail_strategy = TailStrategy::RoundUp;
+            } else if (stage_idx == 0) {
                 // Pure stages that access the input use shiftinwards
-                tail_strategy = TailStrategy::ShiftInwards;
+                pure_var_tail_strategy = TailStrategy::ShiftInwards;
+            } else {
+                // For pure vars in update stages that access the
+                // input, it's not safe to round up or redundantly
+                // recompute
+                pure_var_tail_strategy = TailStrategy::GuardWithIf;
             }
 
             if (!size.empty()) {
@@ -2688,11 +2711,17 @@ struct LoopNest {
                         }
                         if (split_factor > 1) {
                             VarOrRVar vec(Var(innermost_pure_var->var.name() + "_vec"));
+                            auto tail_strategy = pure_var_tail_strategy;
+                            if (stage_idx != 0 && !innermost_pure_var->outermost) {
+                                // Ugh, we'll be using vector predication
+                                tail_strategy = TailStrategy::GuardWithIf;
+                            }
                             s.split(innermost_pure_var->var, innermost_pure_var->var, vec, split_factor, tail_strategy)
                                 .vectorize(vec);
                             FuncVars::FuncVar v = *innermost_pure_var;
                             v.extent = split_factor;
                             v.var = vec;
+                            v.outermost = false;
                             innermost_pure_var->extent += split_factor - 1;
                             innermost_pure_var->extent /= split_factor;
                             vars.vars.insert(vars.vars.begin(), v);
@@ -2721,20 +2750,31 @@ struct LoopNest {
                                 inner = RVar(parent.var.name() + "i");
                             }
                             debug(0) << "Splitting " << parent.var.name() << " by " << factor << "\n";
+                            debug(0) << "Outermost: " << parent.outermost << " stage_idx: " << stage_idx << "\n";
+                            auto tail_strategy = pure_var_tail_strategy;
+                            // If it's an RVar, or not the outermost split and we're in an update, we need a guard with if instead.
+                            if (parent.var.is_rvar || (stage_idx != 0 && !parent.outermost)) {
+                                tail_strategy = TailStrategy::GuardWithIf;
+                            }
                             s.split(parent.var, outer, inner, (int)factor, tail_strategy);
                             v = parent;
                             parent.var = outer;
                             parent.extent = size[i];
                             v.var = inner;
                             v.extent = factor;
+                            v.parallel = false;
+                            v.outermost = false;
                         }
                         new_inner.push_back(v);
                     }
-                    for (int i = 0; i < node->func.dimensions(); i++) {
-                        if (!vars.vars[i].exists) continue;
-                        here = LoopLevel(node->func, vars.vars[i].var);
+                    bool found = false;
+                    for (const auto &v : vars.vars) {
+                        if (!v.exists) continue;
+                        here = LoopLevel(node->func, v.var);
+                        found = true;
                         break;
                     }
+                    internal_assert(found) << "Could not find appropriate compute_at location for children of " << node->func.name() << "\n";
                     vars.vars.insert(vars.vars.begin(), new_inner.begin(), new_inner.end());
                 }
             }
@@ -2746,6 +2786,7 @@ struct LoopNest {
             }
             for (auto &c : children) {
                 if (c->node != node) {
+                    debug(0) << "Compute_at: " << c->node->func.name() << " " << here.lock().to_string() << "\n";
                     Func(c->node->func).compute_at(here);
                 }
                 c->apply(here, vars_map, num_cores, depth + 1, this);
@@ -2834,7 +2875,7 @@ struct State {
 
             int num_stages = (int)features.size();
 
-            const int schedule_feat_size = 25;
+            const int schedule_feat_size = 26;
 
             Runtime::Buffer<float> schedule_features;
 
@@ -2852,12 +2893,6 @@ struct State {
                     const int64_t *sched_stats = (const int64_t *)(&feat);
                     for (int i = 0; i < schedule_feat_size; i++) {
                         schedule_features(i, stage) = sched_stats[i];
-                    }
-
-                    // HACK: The current weights were trained with inlined Funcs not having parallelism features set
-                    if (feat.inlined_calls > 0) {
-                        schedule_features(8, stage) = 0;
-                        schedule_features(9, stage) = 0;
                     }
 
                     stage += 1;
@@ -2889,21 +2924,24 @@ struct State {
                     per_element_compute_cost += pipeline_feat[i];
                 }
 
-                // We can only compute in multiples of the vector size
-                /*
-                  if (feat.inlined_calls == 0) {
-                  int64_t vectors = (feat.innermost_pure_loop_extent + stage.vector_size - 1) / stage.vector_size;
-                  vectors *= feat.points_computed_total / feat.innermost_pure_loop_extent;
-                  compute_cost = per_element_compute_cost * vectors * stage.vector_size;
-                  // TODO: doesn't capture compute inflation on stages inlined into this one! Need vector overcompute as a feature, probably
-                  }
-                */
+                // Assume that narrow types are cheaper because they vectorize wider.
+                compute_cost *= 8.0 / feat.native_vector_size; // Relative to fp32
+
                 compute_cost = per_element_compute_cost * feat.points_computed_total;
 
                 // Figure out vector overcompute
                 const int native_vector_size = feat.native_vector_size;
                 const double idle_simd_lanes = (double)native_vector_size / feat.vector_size;
-                const double vector_recompute = (double)feat.rounded_innermost_pure_loop_extent / feat.innermost_pure_loop_extent;
+
+                // If ShiftInwards or RoundUp, rounding up to a whole
+                // number of vectors is a reasonable estimate of cost
+                // const double vector_recompute = (double)feat.rounded_innermost_pure_loop_extent / feat.innermost_pure_loop_extent;
+
+                // If GuardWithIf, we must assume the tail scalarized
+                // and that each element costs as much as an entire
+                // vector
+                const int tail = feat.innermost_pure_loop_extent + feat.vector_size - feat.rounded_innermost_pure_loop_extent;
+                const double vector_recompute = (double)(feat.innermost_pure_loop_extent - tail + tail * feat.vector_size) / feat.innermost_pure_loop_extent;
 
                 // Inlining saves a call node, which in our cost
                 // model costs...
@@ -2963,21 +3001,40 @@ struct State {
                     }
                 }
 
-                double cache_misses = 0, cost_of_miss = 0;
+                double cold_cache_misses = 0, cost_of_cold_miss = 0, capacity_cache_misses = 0, cost_of_capacity_miss = 0;
                 if (feat.inlined_calls == 0) {
-                    // Estimate the number of cache misses on the data that this reads from and their cost
+                    // Estimate the number of cold cache misses on the data that this reads from and their cost
                     // Cost dominated by lines not bytes due to streaming prefetchers
-                    cache_misses = feat.lines_read_per_realization + feat.bytes_read_per_realization * 1e-3;
-                    cache_misses *= feat.num_realizations;
+                    cold_cache_misses = (feat.unique_lines_read_per_realization +
+                                         feat.unique_bytes_read_per_realization * 1e-3);
+
+                    cold_cache_misses *= feat.num_realizations;
                     //int64_t footprint = std::min(feat.allocation_bytes_read_per_realization, feat.bytes_read_per_realization);
                     int64_t footprint = feat.allocation_bytes_read_per_realization;
                     //cost_of_miss = std::sqrt(footprint) * params.balance * 5e-3;
-                    cost_of_miss = footprint * params.balance * 1e-6;
+                    cost_of_cold_miss = footprint * params.balance * 1e-6;
+
+                    // Now estimate the number of capacity-related cache misses using the total number of bytes read.
+
+                    // We have a number of unique bytes read. Call the
+                    // cache level large enough to fit it L(n+1). The
+                    // next cache level in is Ln. How many misses will
+                    // we incur in Ln? If we load randomly within the
+                    // footprint, we'll miss some constant fraction of
+                    // the time. The cost of such a miss is the cost
+                    // of going out to cache level L(n+1). Note that
+                    // *cold* misses, by contrast, go out to the cache
+                    // level that fits the entire source allocation,
+                    // not just the footprint accessed of it.
+                    capacity_cache_misses = feat.non_unique_bytes_read_per_realization * 1e-2;
+                    cost_of_capacity_miss = feat.unique_bytes_read_per_realization * params.balance * 1e-6;
+
+                    // We'll assume multiway caches work well and ignore the other 'C' (conflict cache misses).
                 }
 
-                double memory_load_cost = cache_misses * cost_of_miss;
+                double memory_load_cost = cold_cache_misses * cost_of_cold_miss + capacity_cache_misses * cost_of_capacity_miss;
 
-                cache_misses = cost_of_miss = 0;
+                double cache_misses = 0, cost_of_miss = 0;
                 if (feat.inlined_calls == 0) {
                     // Estimate the number of cache misses on the data that this writes to and their cost
                     int64_t lines_written_per_realization = feat.bytes_at_realization / feat.innermost_bytes_at_realization;
@@ -3125,7 +3182,7 @@ struct State {
                 int64_t extent = vars.back().second;
                 auto v = vars.back().first;
 
-                if (v.is_rvar) {
+                if (v.is_rvar && extent > 1) {
                     // We may have slid something over this loop. Better stop.
                     break;
                 }
@@ -3463,7 +3520,8 @@ IntrusivePtr<State> optimal_schedule(FunctionDAG &dag,
     IntrusivePtr<State> best;
 
     std::unordered_set<uint64_t> permitted_hashes;
-    for (int i = 0; i < 5; i++) {
+    int num_passes = (beam_size == 1) ? 1 : 5;
+    for (int i = 0; i < num_passes; i++) {
         auto pass = optimal_schedule_pass(dag, outputs, params, throughput_predictor, beam_size, i, permitted_hashes);
         debug(0) << "\nPass " << i << " result:\n";
         pass->dump();
@@ -3552,6 +3610,174 @@ std::string generate_schedules_new(const std::vector<Function> &outputs,
     return "";
 }
 
+bool autotuner_errored = false;
+void autotuner_error_handler(void *, const char *msg) {
+    autotuner_errored = true;
+    debug(0) << "Error during autotuning: " << msg << "\n";
+}
+
+std::string generate_schedules_autotune(const std::vector<Function> &output_funcs,
+                                        const Target &target,
+                                        const MachineParams &params) {
+    const int beam_size = 50;
+
+    ThroughputPredictorPipeline tp;
+
+    struct Trial {
+        std::unique_ptr<FunctionDAG> dag;
+        IntrusivePtr<State> optimal;
+        vector<Function> outputs;
+        map<string, Function> env;
+        Pipeline p;
+    };
+
+    const int max_history = 1024;
+    const int batch_size = 2;
+    vector<std::shared_ptr<Trial>> history;
+    Runtime::Buffer<float> runtimes(max_history);
+    size_t cursor = 0;
+
+    // Compute an environment
+    map<string, Function> env;
+    for (Function f : output_funcs) {
+        populate_environment(f, env);
+    }
+
+    // Use a thread pool for compilation jobs. LLVM is slow.
+    ThreadPool<void> thread_pool;
+
+    float learning_rate = 0.00001f;
+
+    for (int iter = 0;; iter++) {
+
+        size_t batch_start = cursor;
+
+        // Make a batch of schedules
+        for (int b = 0; b < batch_size; b++) {
+            // Exploitation
+            int bs = (b == 0) ? beam_size : 1;
+            // Exploration
+            random_dropout_threshold = (b == 0) ? 100 : 90;
+
+            // Create a deep-copy of the entire graph of Funcs.
+            vector<Function> outputs;
+            map<string, Function> local_env;
+            std::tie(outputs, local_env) = deep_copy(output_funcs, env);
+
+            // Autoschedule it
+            std::unique_ptr<FunctionDAG> dag { new FunctionDAG {outputs, params, target} };
+            std::shared_ptr<Trial> t { new Trial {std::move(dag), nullptr, outputs, local_env} };
+            t->optimal = optimal_schedule(*(t->dag), outputs, params, &tp, bs);
+            if (cursor == history.size()) {
+                history.emplace_back(std::move(t));
+            } else if (cursor < history.size()) {
+                history[cursor] = std::move(t);
+            } else {
+                internal_error << "Bad cursor: " << cursor << " " << history.size() << "\n";
+            }
+
+            // Apply the schedule
+            history[cursor]->optimal->apply_schedule(params);
+            cursor = cursor + 1;
+            if (cursor == max_history) cursor = 0;
+        }
+
+        // Compile them
+        vector<std::future<void>> jobs(batch_size);
+        for (int b = 0; b < batch_size; b++) {
+            debug(0) << "Compiling batch member " << b << "\n";
+            Trial *t = history[(batch_start + b) % max_history].get();
+            internal_assert(t->outputs.size() == 1) << "Multiple outputs not yet supported\n";
+            Function o = t->outputs[0];
+            t->p = Pipeline(Func(o));
+            internal_assert(o.output_types().size() == 1) << "Tuple outputs not yet supported\n";
+            jobs[b] = thread_pool.async([=]() {t->p.compile_jit(target);});
+        }
+
+        for (int b = 0; b < batch_size; b++) {
+            jobs[b].wait();
+        }
+
+        int best = -1;
+        size_t best_cursor = 0;
+        double best_runtime = 1e20;
+
+        for (int b = 0; b < batch_size; b++) {
+            debug(0) << "Benchmarking batch member " << b << "\n";
+            Trial *t = history[(batch_start + b) % max_history].get();
+            Function o = t->outputs[0];
+
+            // Make output buffers and run
+            vector<int> sz;
+            sz.resize(o.dimensions());
+            for (const auto &b : o.schedule().estimates()) {
+                int dim = 0;
+                for (dim = 0; dim < o.dimensions(); dim++) {
+                    if (o.args()[dim] == b.var) break;
+                }
+                internal_assert(dim < o.dimensions());
+                const int64_t *sz_ptr = as_const_int(b.extent);
+                sz[dim] = *sz_ptr;
+            }
+            Runtime::Buffer<> buf(o.output_types()[0], sz);
+
+            // Make some input buffers
+            t->p.infer_input_bounds(buf);
+            t->p.set_error_handler(autotuner_error_handler);
+
+            // Benchmark it
+            autotuner_errored = false;
+            size_t c = (batch_start + b) % max_history;
+            double ms = 1e3 * Tools::benchmark(6, 6, [&]() {t->p.realize(buf);});
+            if (autotuner_errored) {
+                internal_assert(!history.empty()) << "The very first run errored out\n";
+                runtimes(c) = runtimes(0);
+                history[c] = history[0];
+            } else {
+                runtimes(c) = ms;
+            }
+
+            if (runtimes(c) < best_runtime) {
+                best_runtime = runtimes(c);
+                best = b;
+                best_cursor = c;
+            }
+
+            debug(0) << "Runtime " << b << ": " << runtimes(c) << "\n";
+        }
+
+        debug(0) << "Best runtime in batch was " << best << " " << best_runtime << "\n";
+        history[best_cursor]->optimal->dump();
+
+        // Update the model weights
+
+        tp.reset();
+
+        // Find a dummy schedule to paste over any that failed
+
+        // First we enqueue all the features
+        for (size_t i = 0; i < history.size(); i++) {
+            history[i]->optimal->calculate_cost(*(history[i]->dag), params, &tp, false);
+        }
+
+        // Then run the predictor in training mode
+        if (history.size() >= 64) {
+            float old_loss = 1e20;
+            int i = 0;
+            for (; i < 1000; i++) {
+                float loss = tp.backprop(runtimes.cropped(0, 0, history.size()), learning_rate, old_loss);
+                debug(0) << "Loss: " << loss << "\n";
+                if (loss >= old_loss) break;
+                old_loss = loss;
+            }
+            // We want to size the learning rate such that we take about 20 steps
+            if (i > 25) learning_rate *= 1.1f;
+            if (i < 15) learning_rate *= 0.9f;
+        }
+        tp.save_weights();
+    }
+}
+
 void test_convnet_correctness() {
     int n = 1;
     int stages = 10;
@@ -3579,7 +3805,7 @@ void test_convnet_correctness() {
     }
 
     for (int i = 0; i < n; i++) {
-        for (int j = 0; j < 25; j++) {
+        for (int j = 0; j < 26; j++) {
             for (int k = 0; k < stages; k++) {
                 float val = distribution(generator);
                 schedule_features(i, j, k) = val;
@@ -3998,7 +4224,6 @@ void autoschedule_test() {
         debug(0) << "Time per schedule considered: " << (1000000 * t) / cost_calcs << " us\n";
     }
 
-
     if (1) {
         // A gather that only uses a small portion of a potentially
         // large LUT. The number of points computed should be less
@@ -4023,6 +4248,36 @@ void autoschedule_test() {
         optimal->calculate_cost(dag, params, tpp, true);
         if (tpp) tpp->evaluate_costs();
         optimal->dump();
+    }
+
+    // Autotune a small-footprint convolution. Disabled by default because this test does not currently terminate.
+    if (0) {
+        Func f("f"), g("g"), h("h");
+        f(x, y) = (x + y) * (x + 2*y) * (x + 3*y);
+        h(x, y) = (f(x-1, y-1) + f(x, y-1) + f(x+1, y-1) +
+                   f(x-1, y  ) + f(x, y  ) + f(x+1, y  ) +
+                   f(x-1, y+1) + f(x, y+1) + f(x+1, y-1));
+
+        h.estimate(x, 0, 5000).estimate(y, 0, 5000);
+        generate_schedules_autotune({h.function()}, target, params);
+    }
+
+    // Autotune a stencil chain. Disabled by default because this test does not currently terminate.
+    if (0) {
+        const int N = 8;
+        Func f[N];
+        f[0](x, y) = (x + y) * (x + 2*y) * (x + 3*y);
+        for (int i = 1; i < N; i++) {
+            Expr e = 0;
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    e += f[i-1](x + dx, y + dy);
+                }
+            }
+            f[i](x, y) = e;
+        }
+        f[N-1].estimate(x, 0, 2048).estimate(y, 0, 2048);
+        generate_schedules_autotune({f[N-1].function()}, target, params);
     }
 }
 

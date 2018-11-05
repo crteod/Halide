@@ -305,7 +305,9 @@ const std::map<std::string, Target::Feature> feature_name_map = {
     {"asan", Target::ASAN},
     {"check_unsafe_promises", Target::CheckUnsafePromises},
     {"hexagon_dma", Target::HexagonDma},
+    {"embed_bitcode", Target::EmbedBitcode},
     {"new_autoscheduler", Target::NewAutoscheduler},
+    {"autotune", Target::Autotune},
     // NOTE: When adding features to this map, be sure to update
     // PyEnums.cpp and halide.cmake as well.
 };
