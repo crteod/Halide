@@ -3284,7 +3284,9 @@ public:
         return std::move(storage[sz]);
     }
 
-    const std::vector<IntrusivePtr<State>> &get_storage() {
+    const std::vector<IntrusivePtr<State>> &get_sorted_storage() {
+        std::sort_heap(storage.begin(), storage.begin() + sz, CompareStates{});
+        std::reverse(storage.begin(), storage.begin() + sz);
         return storage;
     }
 
@@ -3599,13 +3601,15 @@ IntrusivePtr<State> optimal_schedule_pass_manual(FunctionDAG &dag,
             }
         }
 
-        string select_message = selection_required ? "] Select a partial schedule:\n" : "] Selecting the only partial schedule:\n";
+        auto pending_sorted = pending.get_sorted_storage();
+
+        const string select_message = selection_required ? "] Select a partial schedule:\n" : "] Selecting the only partial schedule:\n";
         debug(0) << "\n--------------------\n";
         debug(0) << "\n[Level " << level << ", beam_size = " << beam_size << select_message;
 
         for (int i_pending = 0; (i_pending <= beam_size) && (i_pending < (int)pending.size()); ++i_pending) {
 
-            IntrusivePtr<State> state {pending.get_storage()[i_pending]};
+            IntrusivePtr<State> state {pending_sorted[i_pending]};
 
             if (selection_required) {
                 debug(0) << "\n[" << i_pending << "]:\n";
@@ -3625,7 +3629,7 @@ IntrusivePtr<State> optimal_schedule_pass_manual(FunctionDAG &dag,
             std::cin >> selection;
         }
 
-        IntrusivePtr<State> state_selected {std::move(pending.get_storage()[selection])};
+        IntrusivePtr<State> state_selected {std::move(pending_sorted[selection])};
 
         if (selection_required) {
             debug(0) << "\nOption selected: [" << selection << "]\n";
