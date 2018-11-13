@@ -4237,7 +4237,7 @@ void autoschedule_test() {
     // test_convnet_correctness();
 
     MachineParams params(16, 16 * 1024 * 1024, 40);
-    //size_t beam_size = 1;
+    size_t beam_size = 1;
     // Use a fixed target for the analysis to get consistent results from this test.
     Target target("x86-64-linux-sse41-avx-avx2");
 
