@@ -3503,6 +3503,8 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
         std::unordered_map<uint64_t, int> hashes;
         q.swap(pending);
 
+        debug(0) << "\n\n!!!!! pending.size() = " << pending.size() << " !!!!!\n";
+
         internal_assert(!pending.empty());
 
         if ((int)pending.size() > beam_size * 10000) {
@@ -3658,7 +3660,9 @@ IntrusivePtr<State> optimal_schedule_pass_manual(FunctionDAG &dag,
 
     // A progress bar.
     uint32_t counter = 0;
+    bool draw_progress_bar = isatty(2);
     auto tick = [&](double progress) {
+        if (!draw_progress_bar) return;
         counter++;
         const int bits = 11;
         if (counter & ((1 << bits) - 1)) return;
@@ -3721,31 +3725,33 @@ IntrusivePtr<State> optimal_schedule_pass_manual(FunctionDAG &dag,
 
             IntrusivePtr<State> state {pending.pop()};
 
-            // Apply cost penalties to the queue according to
-            // structural uniqueness.
-            if (!state->penalized) {
-                uint64_t h1 = state->structural_hash(pass_idx + 1, params.parallelism);
-                uint64_t h0 = state->structural_hash(pass_idx - 1, params.parallelism);
-                int penalty = ++hashes[h1];
-                if (pass_idx > 0 && !permitted_hashes.count(h0)) {
-                    // It's possible to get yourself into a state
-                    // where the only things in the beam that match
-                    // the hash were quick-rejected due to details not
-                    // captured in the hash, so we apply a huge
-                    // penalty, but leave the impermissible state in
-                    // the beam.
-                    // debug(0) << "\nImpermissible hash " << pass_idx << " at " << state->num_funcs_scheduled << " " << h0 << ":\n";
-                    // state->dump();
-                    penalty += 10;
-                }
-                if (penalty > 1) {
-                    state->penalized = true;
-                    state->cost *= penalty;
-                    // After penalizing this state, it's no longer the
-                    // best, defer it.
-                    if (!pending.empty() && state->cost > pending.top()->cost) {
-                        pending.emplace(std::move(state));
-                        continue;
+            if (beam_size > 1) {
+                // Apply cost penalties to the queue according to
+                // structural uniqueness.
+                if (!state->penalized) {
+                    uint64_t h1 = state->structural_hash(pass_idx + 1, params.parallelism);
+                    uint64_t h0 = state->structural_hash(pass_idx - 1, params.parallelism);
+                    int penalty = ++hashes[h1];
+                    if (pass_idx > 0 && !permitted_hashes.count(h0)) {
+                        // It's possible to get yourself into a state
+                        // where the only things in the beam that match
+                        // the hash were quick-rejected due to details not
+                        // captured in the hash, so we apply a huge
+                        // penalty, but leave the impermissible state in
+                        // the beam.
+                        // debug(0) << "\nImpermissible hash " << pass_idx << " at " << state->num_funcs_scheduled << " " << h0 << ":\n";
+                        // state->dump();
+                        penalty += 10;
+                    }
+                    if (penalty > 1) {
+                        state->penalized = true;
+                        state->cost *= penalty;
+                        // After penalizing this state, it's no longer the
+                        // best, defer it.
+                        if (!pending.empty() && state->cost > pending.top()->cost) {
+                            pending.emplace(std::move(state));
+                            continue;
+                        }
                     }
                 }
             }
@@ -3808,46 +3814,61 @@ IntrusivePtr<State> optimal_schedule_pass_manual(FunctionDAG &dag,
         // Drop the other states unconsidered.
         pending.clear();
 
-        // Print user choices.
-        const string select_message = selection_required ? "] Select a partial schedule:\n" : "] Selecting the only partial schedule:\n";
-        debug(0) << "\n--------------------\n";
-        debug(0) << "\n[Level " << i << ", beam_size = " << beam_size << select_message;
+        string cyos_str = get_env_variable("HL_CYOS");
+        if (cyos_str == "1") {
 
-        for (int choice_label = 0; choice_label < (int)user_choices.size(); ++choice_label)
-        {
-            IntrusivePtr<State> state {user_choices[choice_label]};
+            // Print user choices.
+            const string select_message = selection_required ? "] Select a partial schedule:\n"
+                                                             : "] Selecting the only partial schedule:\n";
+            debug(0) << "\n--------------------\n";
+            debug(0) << "\n[Level " << i << ", beam_size = " << beam_size << select_message;
+
+            for (int choice_label = 0; choice_label < (int) user_choices.size(); ++choice_label) {
+                IntrusivePtr<State> state{user_choices[choice_label]};
+
+                if (selection_required) {
+                    debug(0) << "\n[" << choice_label << "]:\n";
+                    state->dump();
+                    if (choice_label == beam_size) {
+                        debug(0) << "\nStopping at option beam_size = " << beam_size << ".\n";
+                    }
+                } else {
+                    state->dump();
+                }
+            }
+
+            // Select next partial schedule to expand.
+            int selection = 0;
+            if (selection_required) {
+                debug(0) << "\nEnter selection: ";
+                std::cin >> selection;
+            }
+
+            IntrusivePtr<State> state_selected{user_choices[selection]};
 
             if (selection_required) {
-                debug(0) << "\n[" << choice_label << "]:\n";
-                state->dump();
-                if (choice_label == beam_size) {
-                    debug(0) << "\nStopping at option beam_size = " << beam_size << ".\n";
+                debug(0) << "\nOption selected: [" << selection << "]\n";
+                state_selected->dump();
+            }
+
+            if (state_selected->num_funcs_scheduled == (int) dag.nodes.size()) {
+                return state_selected;
+            }
+
+            // Generate next potential user choices.
+            state_selected->generate_children(dag, params, throughput_predictor, enqueue_new_children);
+
+        } else
+        {
+            for (auto choice : user_choices)
+            {
+                if (choice->num_funcs_scheduled == (int) dag.nodes.size()) {
+                    return choice;
                 }
-            } else {
-                state->dump();
+
+                choice->generate_children(dag, params, throughput_predictor, enqueue_new_children);
             }
         }
-
-        // Select next partial schedule to expand.
-        int selection = 0;
-        if (selection_required) {
-            debug(0) << "\nEnter selection: ";
-            std::cin >> selection;
-        }
-
-        IntrusivePtr<State> state_selected {user_choices[selection]};
-
-        if (selection_required) {
-            debug(0) << "\nOption selected: [" << selection << "]\n";
-            state_selected->dump();
-        }
-
-        if (state_selected->num_funcs_scheduled == (int)dag.nodes.size()) {
-            return state_selected;
-        }
-
-        // Generate next potential user choices.
-        state_selected->generate_children(dag, params, throughput_predictor, enqueue_new_children);
 
         if (throughput_predictor) {
             // Now evaluate all the costs and re-sort them in the priority queue
