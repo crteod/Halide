@@ -36,8 +36,6 @@ namespace Internal {
 
 using namespace AutoScheduleModel;
 
-int my_debug = 1;
-
 namespace {
 
 using std::string;
@@ -3223,9 +3221,6 @@ struct State {
                            const MachineParams &params,
                            ThroughputPredictorPipeline *throughput_predictor,
                            std::function<void(IntrusivePtr<State> &&)> &accept_child) const {
-        debug(0) << "\n(----- generate_children called on: -----)\n";
-        this->dump();
-
         internal_assert(root.defined() && root->is_root());
 
         if (num_funcs_scheduled == (int)dag.nodes.size()) {
@@ -3506,7 +3501,6 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
 
     int max_expandable = (cyos_str == "1") ? INT_MAX : beam_size;
     for (int i = 0; ; i++) {
-        debug(0) << "\n(----- Level " << i << " -----)\n";
         std::unordered_map<uint64_t, int> hashes;
         std::vector<IntrusivePtr<State>> expandable_choices;
         q.swap(pending);
@@ -3643,11 +3637,6 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
                 debug(0) << "\n[0] - Go back to:\n";
                 grandparent_state->dump();
 
-                /*// Notify if truncating list of options
-                if ((int) expandable_choices.size() == beam_size) {
-                    debug(0) << "\nStopping at option beam_size = " << beam_size << ".";
-                }*/
-
                 // Wait for user to select next partial schedule to expand (or return)
                 while (selection < 0 || selection > count_choices) {
                     debug(0) << "\nEnter selection from [1-" << count_choices << "], or '0' to go back: ";
@@ -3664,6 +3653,7 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
             if (!selection) {
                 // Go back to parent of previous choices
                 internal_assert(has_grandparent);
+                // TODO: avoid const_cast?
                 state_selected = const_cast<State*>(grandparent_state.get());
                 i = i - 2;
             } else {
@@ -3712,24 +3702,14 @@ IntrusivePtr<State> optimal_schedule(FunctionDAG &dag,
     IntrusivePtr<State> best;
 
     std::unordered_set<uint64_t> permitted_hashes;
+    // TODO: adjust num_passes based on interactive env var
     //int num_passes = (beam_size == 1) ? 1 : 5;
     int num_passes = 1;
     for (int i = 0; i < num_passes; i++) {
         auto pass = optimal_schedule_pass(dag, outputs, params, throughput_predictor, beam_size, i, permitted_hashes);
-        debug(0) << "\n----------1----------\n";
         debug(0) << "\nPass " << i << " result:\n";
         pass->dump();
-        debug(0) << "\n----------2----------\n";
 
-        IntrusivePtr<const State> prev = pass->parent;
-
-        while (prev.defined()) {
-            debug(0) << "\nParent:\n";
-            prev->dump();
-            prev = prev->parent;
-        }
-
-        debug(0) << "\n----------3----------\n";
         if (i == 0 || pass->cost < best->cost) {
             best = pass;
         }
@@ -4116,25 +4096,15 @@ void autoschedule_test() {
         vector<Function> outputs = {h.function()};
         FunctionDAG dag(outputs, params, target);
 
-        debug(my_debug) << "!!!!! 1 !!!!!\n";
-
         auto optimal = optimal_schedule(dag, outputs, params, tpp, 8); //beam_size);
-
-        debug(my_debug) << "!!!!! 2 !!!!!\n";
 
         debug(0) << "** Optimal schedule:\n";
         optimal->calculate_cost(dag, params, tpp, true);
-        debug(0) << '\n';
-        debug(my_debug) << "!!!!! 3 !!!!!\n";
         if (tpp) tpp->evaluate_costs();
-        debug(my_debug) << "!!!!! 4 !!!!!\n";
-        debug(0) << '\n';
         optimal->dump();
         debug(0) << '\n';
-        debug(my_debug) << "!!!!! 5 !!!!!\n";
 
         optimal->apply_schedule(params);
-        debug(my_debug) << "!!!!! 6 !!!!!\n";
         // h.realize(1000, 1000);
 
     }
