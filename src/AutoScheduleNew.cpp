@@ -3789,7 +3789,7 @@ IntrusivePtr<State> optimal_schedule_pass_manual(FunctionDAG &dag,
                     blessed++;
                 }
 
-                //return best;
+                state = best;
             }
 
             /*
