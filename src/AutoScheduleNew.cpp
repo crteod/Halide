@@ -3223,7 +3223,9 @@ struct State {
                            const MachineParams &params,
                            ThroughputPredictorPipeline *throughput_predictor,
                            std::function<void(IntrusivePtr<State> &&)> &accept_child) const {
-        debug(0) << "\n(----- generate_children called -----)\n";
+        debug(0) << "\n(----- generate_children called on: -----)\n";
+        this->dump();
+
         internal_assert(root.defined() && root->is_root());
 
         if (num_funcs_scheduled == (int)dag.nodes.size()) {
@@ -3504,7 +3506,9 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
 
     int max_expandable = (cyos_str == "1") ? INT_MAX : beam_size;
     for (int i = 0; ; i++) {
+        debug(0) << "\n(----- Level " << i << " -----)\n";
         std::unordered_map<uint64_t, int> hashes;
+        std::vector<IntrusivePtr<State>> expandable_choices;
         q.swap(pending);
 
         internal_assert(!pending.empty());
@@ -3516,8 +3520,6 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
                 pending.pop()->dump();
             }
         }
-
-        std::vector<IntrusivePtr<State>> user_choices;
 
         expandable = 0;
         while (expandable < max_expandable && !pending.empty()) {
@@ -3606,47 +3608,69 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
               state->calculate_cost(dag, params, nullptr, true);
             */
 
-            user_choices.push_back(std::move(state));
+            expandable_choices.push_back(std::move(state));
             expandable++;
         }
 
         // Drop the other states unconsidered.
         pending.clear();
 
+        // Check if interactive user scheduling
         if (cyos_str == "1") {
-            const bool selection_required = user_choices.size() > 1;
+            const int count_choices = expandable_choices.size();
+            const bool selection_required = count_choices > 1;
+            int selection = selection_required ? -1 : 1;
+            const bool has_grandparent = expandable_choices[0]->parent.defined() && expandable_choices[0]->parent->parent.defined();
 
-            // Print user choices.
-            const string select_message = selection_required ? "] Select a partial schedule:\n"
-                                                             : "] Selecting the only partial schedule:\n";
+            IntrusivePtr<const State> grandparent_state;
+            IntrusivePtr<State> state_selected;
+
             debug(0) << "\n--------------------\n";
-            debug(0) << "\n[Level " << i << ", beam_size = " << beam_size << select_message;
 
-            for (int choice_label = (int) user_choices.size() - 1; choice_label >= 0; --choice_label) {
-                IntrusivePtr<State> state{user_choices[choice_label]};
-
-                if (selection_required) {
-                    debug(0) << "\n[" << choice_label << "]:\n";
-                    state->dump();
-                    /*if ((choice_label == 0) && ((int) user_choices.size() == beam_size)) {
-                        debug(0) << "\nStopping at option beam_size = " << beam_size << ".\n";
-                    }*/
-                } else {
-                    state->dump();
-                }
-            }
-
-            // Select next partial schedule to expand.
-            int selection = selection_required ? -1 : 0;
             if (selection_required) {
-                while (selection < 0 || selection >= (int) user_choices.size()) {
-                    debug(0) << "\nEnter selection from [0-" << (user_choices.size() - 1) << "]: ";
+                // Print user choices.
+                debug(0) << "\n[Level " << i << ", beam_size = " << beam_size << "] Select a partial schedule:\n";
+
+                for (int choice_label = count_choices; choice_label > 0; --choice_label) {
+
+                    debug(0) << "\n[" << choice_label << "]:\n";
+                    expandable_choices[choice_label - 1]->dump();
+                }
+
+                // Print option to go back
+                internal_assert(has_grandparent);
+                grandparent_state = expandable_choices[0]->parent->parent;
+                debug(0) << "\n[0] - Go back to:\n";
+                grandparent_state->dump();
+
+                /*// Notify if truncating list of options
+                if ((int) expandable_choices.size() == beam_size) {
+                    debug(0) << "\nStopping at option beam_size = " << beam_size << ".";
+                }*/
+
+                // Wait for user to select next partial schedule to expand (or return)
+                while (selection < 0 || selection > count_choices) {
+                    debug(0) << "\nEnter selection from [1-" << count_choices << "], or '0' to go back: ";
                     std::cin >> selection;
-                };
+                }
+            } else {
+                // Print the only schedule, automatically selected
+                debug(0) << "\n[Level " << i << ", beam_size = " << beam_size << "] Selecting the only partial schedule:\n";
+                expandable_choices[0]->dump();
             }
 
-            IntrusivePtr<State> state_selected{user_choices[selection]};
 
+            // Set the state selected to expand or return
+            if (!selection) {
+                // Go back to parent of previous choices
+                internal_assert(has_grandparent);
+                state_selected = const_cast<State*>(grandparent_state.get());
+                i = i - 2;
+            } else {
+                state_selected = expandable_choices[selection - 1];
+            }
+
+            // Print the option that was selected back to user
             if (selection_required) {
                 debug(0) << "\nOption selected: [" << selection << "]\n";
                 state_selected->dump();
@@ -3659,10 +3683,10 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
             // Generate next potential user choices.
             state_selected->generate_children(dag, params, throughput_predictor, enqueue_new_children);
 
-        } else
-        {
-            for (auto choice : user_choices)
-            {
+        } else {
+            // Default autoscheduling:
+            // Generate children for all expandable choices
+            for (auto choice : expandable_choices) {
                 if (choice->num_funcs_scheduled == (int) dag.nodes.size()) {
                     return choice;
                 }
@@ -3692,11 +3716,20 @@ IntrusivePtr<State> optimal_schedule(FunctionDAG &dag,
     int num_passes = 1;
     for (int i = 0; i < num_passes; i++) {
         auto pass = optimal_schedule_pass(dag, outputs, params, throughput_predictor, beam_size, i, permitted_hashes);
-        debug(0) << "\n--------------------\n";
+        debug(0) << "\n----------1----------\n";
         debug(0) << "\nPass " << i << " result:\n";
         pass->dump();
-        debug(0) << "\n--------------------\n";
+        debug(0) << "\n----------2----------\n";
 
+        IntrusivePtr<const State> prev = pass->parent;
+
+        while (prev.defined()) {
+            debug(0) << "\nParent:\n";
+            prev->dump();
+            prev = prev->parent;
+        }
+
+        debug(0) << "\n----------3----------\n";
         if (i == 0 || pass->cost < best->cost) {
             best = pass;
         }
