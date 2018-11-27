@@ -25,7 +25,6 @@ std::mt19937 rng;
 int rand_int(int min, int max) { return (rng() % (max - min + 1)) + min; }
 bool rand_bool() { return rng() % 2 == 0; }
 float rand_float() { return rand_int(0, 1 << 30) / (float)(1 << 30); }
-float uniform_rand() { return static_cast <float>(rand()) / static_cast <float>(RAND_MAX); }
 
 // Generate random expressions
 // Given a vector of expresions and a tree depth, recursively
@@ -129,29 +128,29 @@ Expr random_expr(vector<Expr> inputs, int depth, int func_size) {
         if (func_size > func_size_thresh)
             break;
         auto e1 = random_expr(inputs, depth-1, func_size);
-        return sin(e1);
+        return sin(cast<float>(e1));
     }
     case 4: // tanh
     {
         if (func_size > func_size_thresh)
             break;
         auto e1 = random_expr(inputs, depth-1, func_size);
-        return tanh(e1);
+        return tanh(cast<float>(e1));
     }
     case 5: // exp
     {
         auto e1 = random_expr(inputs, depth-1, func_size);
-        return exp(e1);
+        return fast_exp(cast<float>(e1));
     }
     case 6: // sqrt
     {
         auto e1 = random_expr(inputs, depth-1, func_size);
-        return sqrt(e1);
+        return sqrt(cast<float>(e1));
     }
     case 7: // log
     {
         auto e1 = random_expr(inputs, depth-1, func_size);
-        return log(e1);
+        return fast_log(cast<float>(e1));
     }
     case 8: // condition
     {
@@ -199,15 +198,62 @@ public:
     GeneratorParam<int> max_stages{"max_stages", 20};
 
     Input<Buffer<float>>  input{"input", 3};
+    Input<Buffer<uint8_t>>  uint8_weights {"uint8_weights", 4};
+    Input<Buffer<uint16_t>>  uint16_weights{"uint16_weights", 4};
+    Input<Buffer<uint32_t>>  uint32_weights{"uint32_weights", 4};
+    Input<Buffer<int8_t>>  int8_weights {"int8_weights", 4};
+    Input<Buffer<int16_t>>  int16_weights{"int16_weights", 4};
+    Input<Buffer<int32_t>>  int32_weights{"int32_weights", 4};
+    Input<Buffer<float>>  float32_weights{"float32_weights", 4};
+
     Output<Buffer<float>> output{"output", 3};
+    
+    void set_upcast_types(Type input_type, Type& mult_type, Type& sum_type) { 
+        if (input_type.is_int() && rand_int(0,1)) {
+            int input_bits = input_type.bits();
+            int mult_bits = std::min(32, 2*input_bits);
+            int sum_bits = std::min(32, 2*mult_bits);
+            mult_type = Int(mult_bits);
+            sum_type = Int(sum_bits);
+        } else {
+            mult_type = input_type;
+            sum_type = input_type;
+        }
+        return;
+    }
+  
+    void set_downcast_type(Type input_type, Type& output_type) {
+        if (input_type.is_int() && rand_int(0,1)) {
+            int input_bits = input_type.bits();
+            int factor = rand_int(1,2) * 2;
+            int output_bits = std::min(8, input_bits/factor);
+            output_type = Int(output_bits);
+        } else {
+            output_type = input_type;
+        }
+        return;
+    }
 
-
+    Func get_conv_weights(Type t) {
+        if (t == UInt(8)) return uint8_weights;
+        else if (t == UInt(16)) return uint16_weights;
+        else if (t == UInt(32)) return uint32_weights;
+        else if (t == Int(8)) return int8_weights;
+        else if (t == Int(16)) return int16_weights;
+        else if (t == Int(32)) return int32_weights;
+        else {
+            assert(t == Float(32));
+            return float32_weights;
+        }
+    } 
+    
     struct Stage {
         Func func;
         int w, h, c; // approx width and height and channels; TODO: ADD 4TH DIMENSION FOR BATCH SIZE
 
         static constexpr int max_size = 10000000;
         static constexpr int min_size = 100;
+        static constexpr int max_stride = 3; // for convs and pools
 
         int size() const {
             return w*h*c;
@@ -236,7 +282,7 @@ public:
             if (max_factor <= 1) return 1;
             return std::min(8, 1 << rand_int(1, std::ceil(std::log(max_factor) / std::log(2))));
         }
-
+        
         int random_out_channels() const {
             int min = (min_size + w * h - 1) / (w * h);
             int max = std::min(512, max_size / (w * h));
@@ -251,15 +297,6 @@ public:
                   << " with kernel [" << kernel_min << ", " << kernel_max << "]\n";
 
         vector<Var> args = f.func.args();
-
-        /**
-           Expr def = cast(f.func.value().type(), 0);
-           for (int i = kernel_min; i <= kernel_max; i++) {
-           vector<Expr> coords = make_arguments(f.func.args());
-           coords[dim] += i;
-           def = def + rand_value(f.func.value().type()) * f.func(coords);
-           }
-        **/
 
         // generate random expression using potentially all values in the stencil
         vector<Expr> inputs;
@@ -335,12 +372,12 @@ public:
         if (conv_type == 1) return convolve2D_w(f, kernel_min, kernel_max);
         else return convolve2D_r(f, kernel_min, kernel_max);
     }
-
+    
     Stage pool2D(Stage f, int kernel_min, int kernel_max) {
         int pool_type = rand_int(0,2);
-        if (pool_type == 0) return pool2D_unrolled(f);
-        if (pool_type == 1) return pool2D_w(f);
-        else return pool2D_r(f);
+        if (pool_type == 0) return pool2D_unrolled(f, kernel_min, kernel_max);
+        if (pool_type == 1) return pool2D_w(f, kernel_min, kernel_max);
+        else return pool2D_r(f, kernel_min, kernel_max);
     }
 
     Stage activation(Stage f) {
@@ -352,43 +389,52 @@ public:
     Stage relu_layer(Stage f) {
         std::cout << "Relu\n";
         Func activation("relu");
+        // if input type is int, downcast with 50% chance 
+        Type input_type = f.func.value().type();
+        Type output_type;
+        set_downcast_type(input_type, output_type);
+
         vector<Expr> coords = make_arguments(f.func.args());
-        activation(f.func.args()) = max(0.0f, f.func(coords));
+        activation(f.func.args()) = max(cast(output_type, 0), cast(output_type,f.func(coords)));
         return {activation, f.w, f.h, f.c};
     }
 
     Stage tanh_layer(Stage f) {
         std::cout << "Tanh\n";
         Func activation("tanh");
+        // if input type is int, downcast with 50% chance 
+        Type input_type = f.func.value().type();
+        Type output_type;
+        set_downcast_type(input_type, output_type);
+
         vector<Expr> coords = make_arguments(f.func.args());
-        Expr exp_pos = exp(f.func(coords));
-        Expr exp_neg = exp(-f.func(coords));
-        activation(f.func.args()) = (exp_pos - exp_neg) / (exp_pos + exp_neg); //tanh(f.func(coords));
+        Expr exp_pos = fast_exp(2 * cast<float>(f.func(coords)));
+        activation(f.func.args()) = (exp_pos - 1) / (exp_pos + 1);
         return {activation, f.w, f.h, f.c};
     }
 
     /*** pooling stages ***/
-    Stage pool2D_unrolled(Stage f) { // for now always do 3x3 pool with stride 2
-        std::cout << "Pooling 3x3 stride 2\n";
+    Stage pool2D_unrolled(Stage f, int kernel_min, int kernel_max) { 
         vector<Var> args = f.func.args();
         Func pooled2D("pooled2D" + args[0].name() + args[1].name());
+        int stride = f.random_size_reduce_factor();
+        std::cout << "Pooling unrolled with stride: " << stride << " and kernel [ " << kernel_min 
+          << ", " << kernel_max << "]\n";
 
-        int factor = 2;
-        int min = -(factor+1)/2;
-        int extent = min + factor + 1;
+        int extent = kernel_max - kernel_min + 1;
         int scale = extent * extent;
 
         Expr def = cast(f.func.value().type(), 0);
 
         // Avoid huge unrolled loops
-        if (extent >= 4) return pool2D_r(f);
+        if (extent >= 4) return pool2D_r(f, kernel_min, kernel_max);
 
         // assuming input is 3d: w, h, c
-        for (int i = min; i < min + extent; i++) {
-            for (int j = min; j < min + extent; j++) {
+        for (int i = kernel_min; i <= kernel_max; i++) {
+            for (int j = kernel_min; j <= kernel_max; j++) {
                 vector<Expr> pooled_coords = make_arguments(f.func.args());
-                pooled_coords[0] = pooled_coords[0] * factor + i;
-                pooled_coords[1] = pooled_coords[1] * factor + j;
+                pooled_coords[0] = pooled_coords[0] * stride + i;
+                pooled_coords[1] = pooled_coords[1] * stride + j;
                 if (def.type().is_bool()) {
                     def = def && f.func(pooled_coords);
                 } else {
@@ -403,54 +449,55 @@ public:
 
         pooled2D(args) = def;
 
-        return {pooled2D, (f.w + factor - 1) / factor, (f.h + factor - 1) / factor, f.c};
+        return {pooled2D, (f.w + stride - 1) / stride, (f.h + stride - 1) / stride, f.c};
     }
 
-    // Generate a 3x3 pool with stride 2 of f using a reduction.
-    Stage pool2D_r(Stage f) {
-        std::cout << "Pooling 3x3 stride 2 using reduction\n";
+    Stage pool2D_r(Stage f, int kernel_min, int kernel_max) {
         vector<Var> args = f.func.args();
         Func pooled2D_r("pool2D_r_" + args[0].name() + args[1].name());
-
-        int factor = 2;
-        int min = -(factor+1)/2;
-        int extent = min + factor + 1;
+        int stride = f.random_size_reduce_factor();
+        int extent = kernel_max - kernel_min + 1;
         int scale = extent * extent;
+        
+        std::cout << "Pooling using += with stride: " << stride << " and kernel [ " << kernel_min 
+          << ", " << kernel_max << "]\n";
 
-        RDom r(min, extent, min, extent);
+        RDom r(kernel_min, extent, 
+               kernel_min, extent);
 
         vector<Expr> coords = make_arguments(f.func.args());
         Type ty = f.func.value().type();
-        coords[0] = coords[0] * factor + r.x;
-        coords[1] = coords[1] * factor + r.y;
+        coords[0] = coords[0] * stride + r.x;
+        coords[1] = coords[1] * stride + r.y;
         if (ty.is_bool()) {
+            pooled2D_r(args) = const_true();
             pooled2D_r(args) = pooled2D_r(args) && f.func(coords);
         } else {
             pooled2D_r(args) += f.func(coords) / scale;
         }
 
-        return {pooled2D_r, (f.w + factor - 1) / factor, (f.h + factor - 1) / factor, f.c};
+        return {pooled2D_r, (f.w + stride - 1) / stride, (f.h + stride - 1) / stride, f.c};
     }
 
-    // Generate a 3x3 pool with stride 2 of f using a reduction with a wrapper
-    Stage pool2D_w(Stage f) {
-        std::cout << "Pooling 3x3 stride 2 using sum() helper\n";
+    Stage pool2D_w(Stage f, int kernel_min, int kernel_max) {
         vector<Var> args = f.func.args();
         Func pooled2D_w("pooled2D_w_" + args[0].name() + args[1].name());
-
-        int factor = 2;
-        int min = -(factor+1)/2;
-        int extent = min + factor + 1;
+        int stride = f.random_size_reduce_factor();
+        int extent = kernel_max - kernel_min + 1;
         int scale = extent * extent;
 
-        RDom r(min, extent, min, extent);
+        std::cout << "Pooling using sum() with stride: " << stride << " and kernel [ " << kernel_min 
+          << ", " << kernel_max << "]\n";
+
+        RDom r(kernel_min, extent, 
+               kernel_min, extent);
 
         vector<Expr> coords = make_arguments(f.func.args());
-        coords[0] = (coords[0] * factor + r.x);
-        coords[1] = (coords[1] * factor + r.y);
+        coords[0] = (coords[0] * stride + r.x);
+        coords[1] = (coords[1] * stride + r.y);
         pooled2D_w(args) = sum(cast<float>(f.func(coords))) / scale;
 
-        return {pooled2D_w, (f.w + factor - 1) / factor, (f.h + factor - 1) / factor, f.c};
+        return {pooled2D_w, (f.w + stride - 1) / stride, (f.h + stride - 1) / stride, f.c};
     }
 
     /******* set of 2 dimensional (non separable) convs *********/
@@ -464,21 +511,6 @@ public:
         // Avoid huge unrolled loops
         if (f.c >= 4) return convolve2D_r(f, kernel_min, kernel_max);
 
-        /**
-           Expr def = cast(f.func.value().type(), 0);
-           // assuming input is 3d: w, h, c
-           for (int c = 0; c < f.c; c++)  {
-           for (int i = kernel_min; i <= kernel_max; i++) {
-           for (int j = kernel_min; j <= kernel_max; j++) {
-           vector<Expr> coords = make_arguments(f.func.args());
-           coords[0] += i;
-           coords[1] += j;
-           coords[2] = c;
-           def = def + rand_value(f.func.value().type()) * f.func(coords);
-           }
-           }
-           }
-        **/
         vector<Expr> inputs;
         for (int c = 0; c < f.c; c++)  {
             for (int i = kernel_min; i <= kernel_max; i++) {
@@ -515,19 +547,29 @@ public:
                   << " using +=\n";
 
         vector<Var> args = f.func.args();
-
         Func conv("conv2D_r_" + args[0].name() + args[1].name());
+        // if input type is int, upcast with 50% chance
+        Type mult_type, sum_type;
+        Type input_type = f.func.value().type();
+        Func weights = get_conv_weights(input_type);
+        set_upcast_types(input_type, mult_type, sum_type);
+
+        int stride = f.random_size_reduce_factor();
         RDom r(kernel_min, kernel_max - kernel_min + 1,
                kernel_min, kernel_max - kernel_min + 1,
                0, f.c);
+        
         vector<Expr> coords = make_arguments(f.func.args());
-        coords[0] += r.x;
-        coords[1] += r.y;
-        coords[2] = r.z;
-        conv(args) += rand_value(f.func.value().type()) * (args[2] + 1) * f.func(coords);
+        coords[0] = coords[0] * stride + r.x; // only stride in w and h
+        coords[1] = coords[1] * stride + r.y;
+        coords[2] += r.z;
+        conv(args) += cast(sum_type, cast(mult_type, weights(r.z, r.x, r.y, args[2]) * f.func(coords)));
 
-        return {conv, f.w, f.h, f.random_out_channels()};
-    }
+        Stage out {conv, f.w, f.h, f.random_out_channels()};
+        out.w = (out.w + stride - 1)/stride;
+        out.h = (out.h + stride - 1)/stride;
+        return out;
+    } 
 
     // Generate a random convolution of one dimension of f using a reduction with a wrapper
     Stage convolve2D_w(Stage f, int kernel_min, int kernel_max) {
@@ -537,23 +579,32 @@ public:
                   << " using sum() helper\n";
 
         vector<Var> args = f.func.args();
-
         Func conv("conv2D_w_" + args[0].name() + args[1].name());
+        // if input type is int, upcast with 50% chance
+        Type mult_type, sum_type;
+        Type input_type = f.func.value().type();
+        Func weights = get_conv_weights(input_type);
+        set_upcast_types(input_type, mult_type, sum_type);
+         
+        int stride = f.random_size_reduce_factor();
         RDom r(kernel_min, kernel_max - kernel_min + 1,
                kernel_min, kernel_max - kernel_min + 1,
                0, f.c);
         vector<Expr> coords = make_arguments(f.func.args());
-        coords[0] += r.x;
-        coords[1] += r.y;
+        coords[0] = coords[0] * stride + r.x;
+        coords[1] = coords[1] * stride + r.y;
         coords[2] = r.z;
         // sum() captures free vars in the order found, and the new
         // autoscheduler isn't clever enough to do storage reordering
         // yet, so make sure to put the term that depends on the
         // output channel last.
-        conv(args) = sum(rand_value(f.func.value().type()) * f.func(coords) * (args[2] + 1));
+        conv(args) = sum(cast(sum_type, cast(mult_type, weights(r.z, r.x, r.y, args[2]) * f.func(coords))));
 
         // choose a channel output size - 0.5 prob of doubling channel dim
-        return {conv, f.w, f.h, f.random_out_channels()};
+        Stage out {conv, f.w, f.h, f.random_out_channels()};
+        out.w = (out.w + stride -1)/stride;
+        out.h = (out.h + stride -1)/stride;
+        return out;
     }
 
     // Generate an upsampling or downsampling of dimension dim by factor.
@@ -656,20 +707,17 @@ public:
         std::cout << "Unary op\n";
         Func unary("unary_op");
         vector<Expr> coords = make_arguments(f.func.args());
-        int op_type = rand_int(0,3); // exp, log, sqrt, sin
+        int op_type = rand_int(0,2); // exp, log, sqrt
 
         if (op_type == 0) {
-            unary(f.func.args()) = exp(f.func(coords));
+            unary(f.func.args()) = fast_exp(cast<float>(f.func(coords)));
             std::cout << "Unary op: exp\n";
         } else if (op_type == 1) {
-            unary(f.func.args()) = log(f.func(coords));
+            unary(f.func.args()) = fast_log(cast<float>(f.func(coords)));
             std::cout << "Unary op: log\n";
         } else if (op_type == 2) {
-            unary(f.func.args()) = sqrt(f.func(coords));
+            unary(f.func.args()) = sqrt(cast<float>(f.func(coords)));
             std::cout << "Unary op: sqrt\n";
-        } else {
-            unary(f.func.args()) = sin(f.func(coords));
-            std::cout << "Unary op: sin\n";
         }
         return {unary, f.w, f.h, f.c};
     }
@@ -863,7 +911,7 @@ public:
 
         // use inverse transform sampling to sample next state given current state
         int sample_cdf(int state) {
-            float sample_val = uniform_rand();
+            float sample_val = rand_float();
             for (int i = 0; i < num_states; i++) {
                 if (get(state, i) >= sample_val) {
                     return i;
@@ -967,12 +1015,12 @@ public:
             int kernel_max = rand_int(0, 10);
             return convolve_w(f, dim, kernel_min, kernel_max);
         } else if (stage_type == 3) {
-            int kernel_min = rand_int(-3, 0);
-            int kernel_max = rand_int(0, 3);
+            int kernel_min = rand_int(-5, 0);
+            int kernel_max = rand_int(0, 5);
             return convolve2D(f, kernel_min, kernel_max);
         } else if (stage_type == 4 && f.may_reduce_size() && f.w >= 32 && f.h >= 32) {
-            int kernel_min = rand_int(-3, 0);
-            int kernel_max = rand_int(0, 3);
+            int kernel_min = rand_int(-5, 0);
+            int kernel_max = rand_int(0, 5);
             return pool2D(f, kernel_min, kernel_max);
         } else if (stage_type == 5) {
             return activation(f);
@@ -1059,6 +1107,8 @@ public:
     }
 
     void generate() {
+        rng.seed((int)seed);
+
         // create transition matrix between stages
         TransitionMatrix P;
         P.initialize(num_stage_types);
@@ -1071,8 +1121,6 @@ public:
 
         Func first;
         first(x, y, c) = input(x, y, c);
-
-        rng.seed((int)seed);
 
         vector<Stage> stages;
         // Assume input starts at ~2000x2000
@@ -1104,6 +1152,36 @@ public:
             input.dim(0).set_bounds_estimate(0, 2000)
                 .dim(1).set_bounds_estimate(0, 2000)
                 .dim(2).set_bounds_estimate(0, 3);
+            uint8_weights.dim(0).set_bounds_estimate(0, 512)
+                .dim(1).set_bounds_estimate(-5, 5)
+                .dim(2).set_bounds_estimate(-5, 5)
+                .dim(3).set_bounds_estimate(0, 512);
+            uint16_weights.dim(0).set_bounds_estimate(0, 512)
+                .dim(1).set_bounds_estimate(-5, 5)
+                .dim(2).set_bounds_estimate(-5, 5)
+                .dim(3).set_bounds_estimate(0, 512);
+            uint32_weights.dim(0).set_bounds_estimate(0, 512)
+                .dim(1).set_bounds_estimate(-5, 5)
+                .dim(2).set_bounds_estimate(-5, 5)
+                .dim(3).set_bounds_estimate(0, 512);
+            int8_weights.dim(0).set_bounds_estimate(0, 512)
+                .dim(1).set_bounds_estimate(-5, 5)
+                .dim(2).set_bounds_estimate(-5, 5)
+                .dim(3).set_bounds_estimate(0, 512);
+            int16_weights.dim(0).set_bounds_estimate(0, 512)
+                .dim(1).set_bounds_estimate(-5, 5)
+                .dim(2).set_bounds_estimate(-5, 5)
+                .dim(3).set_bounds_estimate(0, 512);
+            int32_weights.dim(0).set_bounds_estimate(0, 512)
+                .dim(1).set_bounds_estimate(-5, 5)
+                .dim(2).set_bounds_estimate(-5, 5)
+                .dim(3).set_bounds_estimate(0, 512);
+            float32_weights.dim(0).set_bounds_estimate(0, 512)
+                .dim(1).set_bounds_estimate(-5, 5)
+                .dim(2).set_bounds_estimate(-5, 5)
+                .dim(3).set_bounds_estimate(0, 512);
+
+            output.estimate(output.args()[0], 0, 2000);
             output.estimate(output.args()[0], 0, 2000);
             output.estimate(output.args()[1], 0, 2000);
             output.estimate(output.args()[2], 0, 3);

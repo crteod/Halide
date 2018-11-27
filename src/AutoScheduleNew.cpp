@@ -1356,10 +1356,12 @@ vector<vector<int64_t>> generate_tilings(const vector<int64_t> &s, int d, int fa
         result.push_back(vector<int64_t>());
     } else {
         vector<vector<int64_t>> v;
-        // Pick a factor designed to avoid an explosion of options
-        for (int f = factor; f < 1024; f *= 2) {
-            v = generate_tilings(s, d - 1, f, allow_splits, vector_dim, vector_size);
-            if (v.size() < 1024) break;
+        v = generate_tilings(s, d - 1, factor, allow_splits, vector_dim, vector_size);
+        // If we're already generated tons of tiling configs for the
+        // inner loops, search the outer loops with coarser
+        // granularity.
+        while (v.size() > (size_t)factor * 100) {
+            factor *= 2;
         }
 
         for (auto t : v) {
@@ -1383,29 +1385,39 @@ vector<vector<int64_t>> generate_tilings(const vector<int64_t> &s, int d, int fa
                     result.push_back(t);
                 }
             } else {
+                int max_inner = 0;
+                int first_inner = (d == vector_dim) ? vector_size : 1;
+                for (int inner = first_inner; inner < s[d]; inner *= factor) {
+                    int outer = (s[d] + inner - 1) / inner;
+                    if (is_one && outer == 1) continue;
+                    if (is_full && outer == s[d]) continue;
+                    // Stop when we hit inner sizes that would do too much recompute
+                    if (inner > first_inner && inner * outer * 7 > s[d] * 8) break;
+                    max_inner = inner;
+                    t.back() = outer;
+                    result.push_back(t);
+                }
                 for (int outer = 1; outer <= s[d]; outer *= factor) {
                     int inner = (s[d] + outer - 1) / outer;
                     if (is_one && outer == 1) continue;
                     if (is_full && outer == s[d]) continue;
-                    if (outer > inner || (d == vector_dim && outer > inner/vector_size)) break;
+                    // Stop when we get into the regime covered by the loop above.
+                    if (inner < max_inner * 2) break;
+                    // Or when the wasted compute gets too bad.
+                    if (inner * outer * 7 > s[d] * 8) break;
                     t.back() = outer;
                     result.push_back(t);
                 }
-                for (int inner = (d == vector_dim) ? vector_size : 1; inner < s[d]; inner *= factor) {
-                    int outer = (s[d] + inner - 1) / inner;
-                    if (is_one && outer == 1) continue;
-                    if (is_full && outer == s[d]) continue;
-                    if ((d != vector_dim && inner >= outer) || inner/vector_size >= outer) break;
-                    t.back() = outer;
-                    result.push_back(t);
-                }
+
                 // The sequence above (in terms of the inner loop) goes 1 2 4 8 16 ...
                 // but 3 is an important inner tiling factor for matrix multiply ops.
                 int inner3 = (d == vector_dim) ? 3*vector_size : 3;
                 int outer3 = (s[d] + inner3 - 1) / inner3;
                 if (factor == 2 && inner3 < s[d] && outer3 < s[d] && outer3 > 1) {
-                    t.back() = outer3;
-                    result.push_back(t);
+                    if (inner3 * outer3 * 7 <= s[d] * 8) {
+                        t.back() = outer3;
+                        result.push_back(t);
+                    }
                 }
             }
         }
@@ -2373,6 +2385,17 @@ struct LoopNest {
         return false;
     }
 
+    int64_t max_inlined_calls() const {
+        int64_t result = 0;
+        for (auto it = inlined.begin(); it != inlined.end(); it++) {
+            result = std::max(result, it.value());
+        }
+        for (const auto &c : children) {
+            result = std::max(result, c->max_inlined_calls());
+        }
+        return result;
+    }
+
     bool accesses_input_buffer() const {
         for (const auto &c : children) {
             if (c->accesses_input_buffer()) return true;
@@ -2522,7 +2545,15 @@ struct LoopNest {
             // Generate a list of tile sizes to try
             auto tilings = generate_tilings(size, (int)(size.size() - 1), 2, !in_realization, vector_dim, innermost ? vector_size : 1);
 
+            if (tilings.size() > 1000) {
+                debug(0) << "Warning: lots of tilings: " << tilings.size() << "\n";
+            }
+
             for (auto t : tilings) {
+                if (node->func.name() == "output") {
+                    internal_assert(t[2] != 2);
+                }
+
                 if (parent->is_root()) {
                     const auto &l = stage->loop;
                     // Skip root-level tilings that provide
@@ -2941,50 +2972,49 @@ struct State {
         return h;
     }
 
-    bool calculate_cost(const FunctionDAG &dag, const MachineParams &params, ThroughputPredictorPipeline *throughput_predictor,  bool verbose = false) {
+    void compute_featurization(const FunctionDAG &dag, const MachineParams &params, StageMap<ScheduleFeatures> *features) {
         NodeMap<const LoopNest *> compute_site, store_site;
         compute_site.make_large(dag.nodes.size());
         store_site.make_large(dag.nodes.size());
-        StageMap<ScheduleFeatures> features;
-        features.make_large(dag.nodes[0].stages[0].max_id);
+        features->make_large(dag.nodes[0].stages[0].max_id);
         internal_assert(root.defined());
         root->get_compute_sites(compute_site, store_site);
-        root->compute_features(params, compute_site, store_site, 1, 1, nullptr, *root, nullptr, &features);
+        root->compute_features(params, compute_site, store_site, 1, 1, nullptr, *root, nullptr, features);
+    }
 
-        if (verbose) {
-            for (const auto &n : dag.nodes) {
-                for (size_t stage_idx = n.stages.size(); stage_idx > 0; stage_idx--) {
-                    const auto &s = n.stages[stage_idx - 1];
-                    if (!features.contains(&s)) break;
-                    const auto &sched_feat = features.get(&s);
-                    debug(0) << "YYY ";
-                    debug(0) << n.func.name() << ' ' << (stage_idx - 1) << ' ';
-                    const int64_t *sched_stats = (const int64_t *)(&sched_feat);
-                    // binary file for features
-                    string feature_file = get_env_variable("HL_FEATURE_PATH");
-                    std::ofstream binfile(feature_file, std::ios::binary | std::ios_base::trunc);
-                    for (size_t i = 0; i < sizeof(ScheduleFeatures) / sizeof(int64_t); i++) {
-                        // The schedule-based features are all
-                        // naturally multiplicative and have a very
-                        // large dynamic range, so we emit them
-                        // logged
-                        float f = std::log(1 + sched_stats[i]);
-                        debug(0) << f << ' ';
-                        // also write feature to binary file
-                        binfile.write((char*) &f, sizeof(float));
-                    }
-                    const int *stats = (const int *)(&s.features);
-                    for (size_t i = 0; i < sizeof(s.features) / sizeof(int); i++) {
-                        debug(0) << stats[i] << ' ';
-                        float f = (float) stats[i];
-                        binfile.write((char*) &f, sizeof(float));
-                    }
-                    debug(0) << '\n';
-                    binfile.close();
+    void save_featurization(const FunctionDAG &dag, const MachineParams &params, const std::string &feature_file) {
+        StageMap<ScheduleFeatures> features;
+        compute_featurization(dag, params, &features);
+
+        std::ofstream binfile(feature_file, std::ios::binary | std::ios_base::trunc);
+        for (const auto &n : dag.nodes) {
+            for (size_t stage_idx = n.stages.size(); stage_idx > 0; stage_idx--) {
+                const auto &s = n.stages[stage_idx - 1];
+                const size_t num_schedule_features = sizeof(ScheduleFeatures) / sizeof(int64_t);
+                const size_t num_pipeline_features = sizeof(PipelineFeatures) / sizeof(int);
+                const auto &sched_feat = features.get(&s);
+                const int64_t *sched_ints = (const int64_t *)(&sched_feat);
+                const int *pipe_ints = (const int *)(&s.features);
+
+                float buf[num_schedule_features + num_pipeline_features];
+                // Save them as floats
+                for (size_t i = 0; i < num_schedule_features; i++) {
+                    buf[i] = sched_ints[i];
                 }
+
+                for (size_t i = 0; i < num_pipeline_features; i++) {
+                    buf[i + num_schedule_features] = pipe_ints[i];
+                }
+
+                binfile.write((const char *)buf, sizeof(buf));
             }
         }
+        binfile.close();
+    }
 
+    bool calculate_cost(const FunctionDAG &dag, const MachineParams &params, ThroughputPredictorPipeline *throughput_predictor, bool verbose = false) {
+        StageMap<ScheduleFeatures> features;
+        compute_featurization(dag, params, &features);
 
         cost = 0;
 
@@ -2992,7 +3022,8 @@ struct State {
         if (throughput_predictor) {
 
             // Perform any quick rejection tests before enqueuing this
-            // TODO: staging of inputs for repeated reuse scenarios (e.g. gemm) triggers this rejection.
+
+            // TODO: allow massive recompute for stages that are no more expensive than a load from them
             /*
             for (auto it = features.begin(); it != features.end(); it++) {
                 auto &feat = it.value();
@@ -3002,6 +3033,12 @@ struct State {
                 }
             }
             */
+            
+            // Avoid code size explosion from recursive inlining.
+            if (root->max_inlined_calls() > 100) {
+                cost = 1e50;
+                return true;
+            }
 
             int num_stages = (int)features.size();
 
@@ -3725,6 +3762,10 @@ std::string generate_schedules_new(const std::vector<Function> &outputs,
     // Print out the predicted runtime of each Func, so we can compare them to a profile
     // optimal->print_predicted_runtimes(params);
 
+    string feature_file = get_env_variable("HL_FEATURE_FILE");
+    if (!feature_file.empty()) {
+        optimal->save_featurization(dag, params, feature_file);
+    }
 
     return "";
 }
@@ -3903,7 +3944,7 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
         }
 
         // Then run the predictor in training mode once we have enough samples
-        if (history.size() >= max_history) {
+        if (history.size() >= max_history / 2) {
             for (int i = 0; i < 10; i++) {
                 float loss = tp.backprop(runtimes.cropped(0, 0, history.size()), learning_rate);
                 debug(0) << "RMS Loss: " << std::sqrt(loss) << "\n";
@@ -3928,6 +3969,8 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
             internal_assert(history.size() == max_history/2);
         }
     }
+
+    return "";
 }
 
 void test_convnet_correctness() {
@@ -4415,7 +4458,7 @@ void autoschedule_test() {
     }
 
     // Autotune a stencil chain. Disabled by default because this test does not currently terminate.
-    if (0) {
+    if (1) {
         const int N = 8;
         Func f[N];
         f[0](x, y) = (x + y) * (x + 2*y) * (x + 3*y);
@@ -4432,7 +4475,7 @@ void autoschedule_test() {
         generate_schedules_autotune({f[N-1].function()}, target, params);
     }
 
-    if (1) {
+    if (0) {
         // A schedule where it's insane to not compute inside an rvar
         Func f("f"), g("g");
         f(x, y) = x;
