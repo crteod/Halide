@@ -3702,9 +3702,8 @@ IntrusivePtr<State> optimal_schedule(FunctionDAG &dag,
     IntrusivePtr<State> best;
 
     std::unordered_set<uint64_t> permitted_hashes;
-    // TODO: adjust num_passes based on interactive env var
-    //int num_passes = (beam_size == 1) ? 1 : 5;
-    int num_passes = 1;
+    string cyos_str = get_env_variable("HL_CYOS");
+    int num_passes = ((beam_size == 1) || (cyos_str == "1")) ? 1 : 5;
     for (int i = 0; i < num_passes; i++) {
         auto pass = optimal_schedule_pass(dag, outputs, params, throughput_predictor, beam_size, i, permitted_hashes);
         debug(0) << "\nPass " << i << " result:\n";
