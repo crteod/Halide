@@ -13,6 +13,7 @@
 
 extern "C" int halide_autoscheduler_cost_model(int32_t num_stages,
                                                int32_t batch_size,
+                                               int32_t num_cores,
                                                // Inputs
                                                halide_buffer_t *pipeline_features,
                                                halide_buffer_t *schedule_features,
@@ -26,16 +27,6 @@ extern "C" int halide_autoscheduler_cost_model(int32_t num_stages,
                                                halide_buffer_t *head2_bias,
                                                halide_buffer_t *filter1,
                                                halide_buffer_t *bias1,
-                                               halide_buffer_t *filter2,
-                                               halide_buffer_t *bias2,
-                                               halide_buffer_t *filter3,
-                                               halide_buffer_t *bias3,
-                                               halide_buffer_t *filter4,
-                                               halide_buffer_t *bias4,
-                                               halide_buffer_t *filter5,
-                                               halide_buffer_t *bias5,
-                                               halide_buffer_t *filter6,
-                                               halide_buffer_t *bias6,
                                                // Unused
                                                float learning_rate,
                                                int timestep,
@@ -46,6 +37,7 @@ extern "C" int halide_autoscheduler_cost_model(int32_t num_stages,
 
 extern "C" int halide_autoscheduler_train_cost_model(int32_t _num_stages,
                                                      int32_t _batch_size,
+                                                     int32_t _num_cores,
                                                      // Inputs
                                                      halide_buffer_t *pipeline_features,
                                                      halide_buffer_t *schedule_features,
@@ -59,16 +51,6 @@ extern "C" int halide_autoscheduler_train_cost_model(int32_t _num_stages,
                                                      halide_buffer_t *head2_bias,
                                                      halide_buffer_t *filter1,
                                                      halide_buffer_t *bias1,
-                                                     halide_buffer_t *filter2,
-                                                     halide_buffer_t *bias2,
-                                                     halide_buffer_t *filter3,
-                                                     halide_buffer_t *bias3,
-                                                     halide_buffer_t *filter4,
-                                                     halide_buffer_t *bias4,
-                                                     halide_buffer_t *filter5,
-                                                     halide_buffer_t *bias5,
-                                                     halide_buffer_t *filter6,
-                                                     halide_buffer_t *bias6,
                                                      float learning_rate,
                                                      int timestep,
                                                      halide_buffer_t *true_runtime,
@@ -79,16 +61,6 @@ extern "C" int halide_autoscheduler_train_cost_model(int32_t _num_stages,
                                                      halide_buffer_t *d_loss_d_head2_bias,
                                                      halide_buffer_t *d_loss_d_filter1,
                                                      halide_buffer_t *d_loss_d_bias1,
-                                                     halide_buffer_t *d_loss_d_filter2,
-                                                     halide_buffer_t *d_loss_d_bias2,
-                                                     halide_buffer_t *d_loss_d_filter3,
-                                                     halide_buffer_t *d_loss_d_bias3,
-                                                     halide_buffer_t *d_loss_d_filter4,
-                                                     halide_buffer_t *d_loss_d_bias4,
-                                                     halide_buffer_t *d_loss_d_filter5,
-                                                     halide_buffer_t *d_loss_d_bias5,
-                                                     halide_buffer_t *d_loss_d_filter6,
-                                                     halide_buffer_t *d_loss_d_bias6,
                                                      halide_buffer_t *prediction,
                                                      halide_buffer_t *loss);
 
@@ -113,26 +85,6 @@ extern "C" float halide_internal_weights_trunk_conv1_bias[];
 extern "C" int halide_internal_weights_trunk_conv1_bias_length;
 extern "C" float halide_internal_weights_trunk_conv1_weight[];
 extern "C" int halide_internal_weights_trunk_conv1_weight_length;
-extern "C" float halide_internal_weights_trunk_conv2_bias[];
-extern "C" int halide_internal_weights_trunk_conv2_bias_length;
-extern "C" float halide_internal_weights_trunk_conv2_weight[];
-extern "C" int halide_internal_weights_trunk_conv2_weight_length;
-extern "C" float halide_internal_weights_trunk_conv3_bias[];
-extern "C" int halide_internal_weights_trunk_conv3_bias_length;
-extern "C" float halide_internal_weights_trunk_conv3_weight[];
-extern "C" int halide_internal_weights_trunk_conv3_weight_length;
-extern "C" float halide_internal_weights_trunk_conv4_bias[];
-extern "C" int halide_internal_weights_trunk_conv4_bias_length;
-extern "C" float halide_internal_weights_trunk_conv4_weight[];
-extern "C" int halide_internal_weights_trunk_conv4_weight_length;
-extern "C" float halide_internal_weights_trunk_conv5_bias[];
-extern "C" int halide_internal_weights_trunk_conv5_bias_length;
-extern "C" float halide_internal_weights_trunk_conv5_weight[];
-extern "C" int halide_internal_weights_trunk_conv5_weight_length;
-extern "C" float halide_internal_weights_trunk_conv6_bias[];
-extern "C" int halide_internal_weights_trunk_conv6_bias_length;
-extern "C" float halide_internal_weights_trunk_conv6_weight[];
-extern "C" int halide_internal_weights_trunk_conv6_weight_length;
 
 namespace Halide {
 namespace Internal {
@@ -172,21 +124,6 @@ struct Weights {
 
     Runtime::Buffer<float> conv1_filter;
     Runtime::Buffer<float> conv1_bias;
-
-    Runtime::Buffer<float> conv2_filter;
-    Runtime::Buffer<float> conv2_bias;
-
-    Runtime::Buffer<float> conv3_filter;
-    Runtime::Buffer<float> conv3_bias;
-
-    Runtime::Buffer<float> conv4_filter;
-    Runtime::Buffer<float> conv4_bias;
-
-    Runtime::Buffer<float> conv5_filter;
-    Runtime::Buffer<float> conv5_bias;
-
-    Runtime::Buffer<float> conv6_filter;
-    Runtime::Buffer<float> conv6_bias;
 };
 
 class ThroughputPredictorPipeline {
@@ -195,7 +132,7 @@ class ThroughputPredictorPipeline {
     Stats stats;
     Runtime::Buffer<float> schedule_feat_queue, pipeline_feat_queue, costs;
     Runtime::Buffer<double *> cost_ptrs;
-    int cursor, num_stages;
+    int cursor, num_stages, num_cores = 0;
 
     std::string weights_server_hostname;
     int weights_server_port = 0;
@@ -219,6 +156,10 @@ class ThroughputPredictorPipeline {
 
     void set_pipeline_features(const Runtime::Buffer<float> &pipeline_feats) {
         pipeline_feat_queue = pipeline_feats;
+    }
+
+    void set_num_cores(int n) {
+        num_cores = n;
     }
 
     void enqueue(int ns, Runtime::Buffer<float> *schedule_feats, double *cost_ptr) {
@@ -262,12 +203,7 @@ class ThroughputPredictorPipeline {
     Runtime::Buffer<float>
         head1_filter_update, head1_bias_update,
         head2_filter_update, head2_bias_update,
-        conv1_filter_update, conv1_bias_update,
-        conv2_filter_update, conv2_bias_update,
-        conv3_filter_update, conv3_bias_update,
-        conv4_filter_update, conv4_bias_update,
-        conv5_filter_update, conv5_bias_update,
-        conv6_filter_update, conv6_bias_update;
+        conv1_filter_update, conv1_bias_update;
     int timestep = 0;
 
     float backprop(Runtime::Buffer<const float> true_runtimes, float learning_rate) {
@@ -295,23 +231,14 @@ class ThroughputPredictorPipeline {
             head2_bias_update = weight_update_buffer(weights.head2_bias);
             conv1_filter_update = weight_update_buffer(weights.conv1_filter);
             conv1_bias_update = weight_update_buffer(weights.conv1_bias);
-            conv2_filter_update = weight_update_buffer(weights.conv2_filter);
-            conv2_bias_update = weight_update_buffer(weights.conv2_bias);
-            conv3_filter_update = weight_update_buffer(weights.conv3_filter);
-            conv3_bias_update = weight_update_buffer(weights.conv3_bias);
-            conv4_filter_update = weight_update_buffer(weights.conv4_filter);
-            conv4_bias_update = weight_update_buffer(weights.conv4_bias);
-            conv5_filter_update = weight_update_buffer(weights.conv5_filter);
-            conv5_bias_update = weight_update_buffer(weights.conv5_bias);
-            conv6_filter_update = weight_update_buffer(weights.conv6_filter);
-            conv6_bias_update = weight_update_buffer(weights.conv6_bias);
             timestep = 0;
         }
 
         Runtime::Buffer<float> dst = costs.cropped(0, 0, cursor);
-        
+
         halide_autoscheduler_train_cost_model(num_stages,
                                               cursor,
+                                              num_cores,
                                               pipeline_feat_queue,
                                               schedule_feat_queue,
                                               stats.pipeline_mean,
@@ -321,31 +248,26 @@ class ThroughputPredictorPipeline {
                                               weights.head1_filter, weights.head1_bias,
                                               weights.head2_filter, weights.head2_bias,
                                               weights.conv1_filter, weights.conv1_bias,
-                                              weights.conv2_filter, weights.conv2_bias,
-                                              weights.conv3_filter, weights.conv3_bias,
-                                              weights.conv4_filter, weights.conv4_bias,
-                                              weights.conv5_filter, weights.conv5_bias,
-                                              weights.conv6_filter, weights.conv6_bias,
                                               learning_rate, timestep++,
                                               true_runtimes,
                                               head1_filter_update, head1_bias_update,
                                               head2_filter_update, head2_bias_update,
                                               conv1_filter_update, conv1_bias_update,
-                                              conv2_filter_update, conv2_bias_update,
-                                              conv3_filter_update, conv3_bias_update,
-                                              conv4_filter_update, conv4_bias_update,
-                                              conv5_filter_update, conv5_bias_update,
-                                              conv6_filter_update, conv6_bias_update,
                                               dst,
                                               loss);
 
 
+        double err = 0;
         for (int i = 0; i < cursor; i++) {
             internal_assert(cost_ptrs(i)) << "Cost queue entry was null: " << i << "\n";
             *(cost_ptrs(i)) = dst(i);
+            double delta = (true_runtimes(i) - dst(i)) / true_runtimes(0);
+            err += delta * delta;
         }
+        err /= cursor;
+        err = std::sqrt(err);
 
-        
+
         if (!weights_server_hostname.empty()) {
             // Send gradients, receive new weights
             send_gradients_to_weights_server();
@@ -354,6 +276,16 @@ class ThroughputPredictorPipeline {
             // Update weights locally
             auto update_weight = [](const Runtime::Buffer<float> &src, Runtime::Buffer<float> &dst) {
                 dst.copy_from(src.sliced(src.dimensions()-1, 0));
+                /*
+                double grad_mag = 0, weight_mag = 0;
+                auto grad = src.sliced(src.dimensions() - 1, 3);
+                grad.for_each_value([&](float f) {grad_mag += f*f;});
+                auto weight = src.sliced(src.dimensions() - 1, 0);
+                weight.for_each_value([&](float f) {weight_mag += f*f;});
+                debug(0) << std::sqrt(grad_mag / grad.number_of_elements()) << " "
+                << std::sqrt(weight_mag / weight.number_of_elements()) << "\n";
+                */
+
             };
             update_weight(head1_filter_update, weights.head1_filter);
             update_weight(head1_bias_update, weights.head1_bias);
@@ -361,17 +293,11 @@ class ThroughputPredictorPipeline {
             update_weight(head2_bias_update, weights.head2_bias);
             update_weight(conv1_filter_update, weights.conv1_filter);
             update_weight(conv1_bias_update, weights.conv1_bias);
-            update_weight(conv2_filter_update, weights.conv2_filter);
-            update_weight(conv2_bias_update, weights.conv2_bias);
-            update_weight(conv3_filter_update, weights.conv3_filter);
-            update_weight(conv3_bias_update, weights.conv3_bias);
-            update_weight(conv4_filter_update, weights.conv4_filter);
-            update_weight(conv4_bias_update, weights.conv4_bias);
-            update_weight(conv5_filter_update, weights.conv5_filter);
-            update_weight(conv5_bias_update, weights.conv5_bias);
         }
 
-        return loss();
+        internal_assert(cursor != 0);
+
+        return err;
     }
 
     void evaluate_costs() {
@@ -381,11 +307,12 @@ class ThroughputPredictorPipeline {
         internal_assert(schedule_feat_queue.data());
 
         Runtime::Buffer<float> dst = costs.cropped(0, 0, cursor);
-       
+
         auto loss = Runtime::Buffer<float>::make_scalar();
-        
+
         halide_autoscheduler_cost_model(num_stages,
                                         cursor,
+                                        num_cores,
                                         pipeline_feat_queue,
                                         schedule_feat_queue,
                                         stats.pipeline_mean,
@@ -395,11 +322,6 @@ class ThroughputPredictorPipeline {
                                         weights.head1_filter, weights.head1_bias,
                                         weights.head2_filter, weights.head2_bias,
                                         weights.conv1_filter, weights.conv1_bias,
-                                        weights.conv2_filter, weights.conv2_bias,
-                                        weights.conv3_filter, weights.conv3_bias,
-                                        weights.conv4_filter, weights.conv4_bias,
-                                        weights.conv5_filter, weights.conv5_bias,
-                                        weights.conv6_filter, weights.conv6_bias,
                                         0.0f, 0, nullptr,
                                         dst, loss);
 
@@ -430,57 +352,29 @@ class ThroughputPredictorPipeline {
         dst.copy_from(src);
         return dst;
     }
-    
+
     void load_weights() {
+
+        internal_assert(!weights_dir.empty());
 
         if (weights_dir.empty()) {
             weights.head1_filter = Runtime::Buffer<float>(halide_internal_weights_head1_conv1_weight, 24, 56, 7);
-            internal_assert(halide_internal_weights_head1_conv1_weight_length == (int)weights.head1_filter.size_in_bytes());
+            //internal_assert(halide_internal_weights_head1_conv1_weight_length == (int)weights.head1_filter.size_in_bytes());
 
             weights.head1_bias = Runtime::Buffer<float>(halide_internal_weights_head1_conv1_bias, 24);
-            internal_assert(halide_internal_weights_head1_conv1_bias_length == (int)weights.head1_bias.size_in_bytes());
+            //internal_assert(halide_internal_weights_head1_conv1_bias_length == (int)weights.head1_bias.size_in_bytes());
 
             weights.head2_filter = Runtime::Buffer<float>(halide_internal_weights_head2_conv1_weight, 24, 26);
-            internal_assert(halide_internal_weights_head2_conv1_weight_length == (int)weights.head2_filter.size_in_bytes());
+            //internal_assert(halide_internal_weights_head2_conv1_weight_length == (int)weights.head2_filter.size_in_bytes());
 
             weights.head2_bias = Runtime::Buffer<float>(halide_internal_weights_head2_conv1_bias, 24);
-            internal_assert(halide_internal_weights_head2_conv1_bias_length == (int)weights.head2_bias.size_in_bytes());
+            //internal_assert(halide_internal_weights_head2_conv1_bias_length == (int)weights.head2_bias.size_in_bytes());
 
-            weights.conv1_filter = Runtime::Buffer<float>(halide_internal_weights_trunk_conv1_weight, 48, 48, 3);
-            internal_assert(halide_internal_weights_trunk_conv1_weight_length == (int)weights.conv1_filter.size_in_bytes());
+            weights.conv1_filter = Runtime::Buffer<float>(halide_internal_weights_trunk_conv1_weight, 16, 48, 3);
+            //internal_assert(halide_internal_weights_trunk_conv1_weight_length == (int)weights.conv1_filter.size_in_bytes());
 
-            weights.conv1_bias = Runtime::Buffer<float>(halide_internal_weights_trunk_conv1_bias, 48);
-            internal_assert(halide_internal_weights_trunk_conv1_bias_length == (int)weights.conv1_bias.size_in_bytes());
-
-            weights.conv2_filter = Runtime::Buffer<float>(halide_internal_weights_trunk_conv2_weight, 48, 48, 3);
-            internal_assert(halide_internal_weights_trunk_conv2_weight_length == (int)weights.conv2_filter.size_in_bytes());
-
-            weights.conv2_bias = Runtime::Buffer<float>(halide_internal_weights_trunk_conv2_bias, 48);
-            internal_assert(halide_internal_weights_trunk_conv2_bias_length == (int)weights.conv2_bias.size_in_bytes());
-
-            weights.conv3_filter = Runtime::Buffer<float>(halide_internal_weights_trunk_conv3_weight, 96, 48, 3);
-            internal_assert(halide_internal_weights_trunk_conv3_weight_length == (int)weights.conv3_filter.size_in_bytes());
-
-            weights.conv3_bias = Runtime::Buffer<float>(halide_internal_weights_trunk_conv3_bias, 96);
-            internal_assert(halide_internal_weights_trunk_conv3_bias_length == (int)weights.conv3_bias.size_in_bytes());
-
-            weights.conv4_filter = Runtime::Buffer<float>(halide_internal_weights_trunk_conv4_weight, 120, 96, 3);
-            internal_assert(halide_internal_weights_trunk_conv4_weight_length == (int)weights.conv4_filter.size_in_bytes());
-
-            weights.conv4_bias = Runtime::Buffer<float>(halide_internal_weights_trunk_conv4_bias, 120);
-            internal_assert(halide_internal_weights_trunk_conv4_bias_length == (int)weights.conv4_bias.size_in_bytes());
-
-            weights.conv5_filter = Runtime::Buffer<float>(halide_internal_weights_trunk_conv5_weight, 168, 120, 3);
-            internal_assert(halide_internal_weights_trunk_conv5_weight_length == (int)weights.conv5_filter.size_in_bytes());
-
-            weights.conv5_bias = Runtime::Buffer<float>(halide_internal_weights_trunk_conv5_bias, 168);
-            internal_assert(halide_internal_weights_trunk_conv5_bias_length == (int)weights.conv5_bias.size_in_bytes());
-
-            weights.conv6_filter = Runtime::Buffer<float>(halide_internal_weights_trunk_conv6_weight, 168);
-            internal_assert(halide_internal_weights_trunk_conv6_weight_length == (int)weights.conv6_filter.size_in_bytes());
-
-            weights.conv6_bias = Runtime::Buffer<float>::make_scalar(halide_internal_weights_trunk_conv6_bias);
-            internal_assert(halide_internal_weights_trunk_conv6_bias_length == (int)weights.conv6_bias.size_in_bytes());
+            weights.conv1_bias = Runtime::Buffer<float>(halide_internal_weights_trunk_conv1_bias, 16);
+            //internal_assert(halide_internal_weights_trunk_conv1_bias_length == (int)weights.conv1_bias.size_in_bytes());
         } else {
             weights.head1_filter = buffer_from_file(weights_dir + "/head1_conv1_weight.data", {24, 56, 7});
             weights.head1_bias = buffer_from_file(weights_dir + "/head1_conv1_bias.data", {24});
@@ -488,24 +382,17 @@ class ThroughputPredictorPipeline {
             weights.head2_filter = buffer_from_file(weights_dir + "/head2_conv1_weight.data", {24, 26});
             weights.head2_bias = buffer_from_file(weights_dir + "/head2_conv1_bias.data", {24});
 
-            weights.conv1_filter = buffer_from_file(weights_dir + "/trunk_conv1_weight.data", {48, 48, 3});
-            weights.conv1_bias = buffer_from_file(weights_dir + "/trunk_conv1_bias.data", {48});
+            weights.conv1_filter = buffer_from_file(weights_dir + "/trunk_conv1_weight.data", {16, 48, 3});
+            weights.conv1_bias = buffer_from_file(weights_dir + "/trunk_conv1_bias.data", {16});
+        }
 
-            weights.conv2_filter = buffer_from_file(weights_dir + "/trunk_conv2_weight.data", {48, 48, 3});
-            weights.conv2_bias = buffer_from_file(weights_dir + "/trunk_conv2_bias.data", {48});
-
-            weights.conv3_filter = buffer_from_file(weights_dir + "/trunk_conv3_weight.data", {96, 48, 3});
-            weights.conv3_bias = buffer_from_file(weights_dir + "/trunk_conv3_bias.data", {96});
-
-            weights.conv4_filter = buffer_from_file(weights_dir + "/trunk_conv4_weight.data", {120, 96, 3});
-            weights.conv4_bias = buffer_from_file(weights_dir + "/trunk_conv4_bias.data", {120});
-
-            weights.conv5_filter = buffer_from_file(weights_dir + "/trunk_conv5_weight.data", {168, 120, 3});
-            weights.conv5_bias = buffer_from_file(weights_dir + "/trunk_conv5_bias.data", {168});
-
-            weights.conv6_filter = buffer_from_file(weights_dir + "/trunk_conv6_weight.data", {168});
-            weights.conv6_bias = buffer_from_file(weights_dir + "/trunk_conv6_bias.data", {});
-
+        if (get_env_variable("HL_RANDOMIZE_WEIGHTS") == "1") {
+            // Fill the weights with random values
+            for_each_weight([](Runtime::Buffer<float> &w) {
+                    w.for_each_value([](float &f) {
+                            f = ((float)rand()) / RAND_MAX - 0.5f;
+                        });
+                });
         }
 
         // The following code is for resizing the weights to a larger size with zero-padding
@@ -520,24 +407,9 @@ class ThroughputPredictorPipeline {
         weights.head2_filter = zero_pad(weights.head2_filter, {24, 26});
         weights.head2_bias = zero_pad(weights.head2_bias, {24});
 
-        weights.conv1_filter = zero_pad(weights.conv1_filter, {48, 48, 3});
-        weights.conv1_bias = zero_pad(weights.conv1_bias, {48});
+        weights.conv1_filter = zero_pad(weights.conv1_filter, {16, 48, 3});
+        weights.conv1_bias = zero_pad(weights.conv1_bias, {16});
 
-        weights.conv2_filter = zero_pad(weights.conv2_filter, {48, 48, 3});
-        weights.conv2_bias = zero_pad(weights.conv2_bias, {48});
-
-        weights.conv3_filter = zero_pad(weights.conv3_filter, {96, 48, 3});
-        weights.conv3_bias = zero_pad(weights.conv3_bias, {96});
-
-        weights.conv4_filter = zero_pad(weights.conv4_filter, {120, 96, 3});
-        weights.conv4_bias = zero_pad(weights.conv4_bias, {120});
-
-        weights.conv5_filter = zero_pad(weights.conv5_filter, {168, 120, 3});
-        weights.conv5_bias = zero_pad(weights.conv5_bias, {168});                                                
-
-        weights.conv6_filter = zero_pad(weights.conv6_filter, {168});
-        weights.conv6_bias = weights.conv6_bias;
-        
         save_weights();
         #endif
     }
@@ -572,16 +444,6 @@ class ThroughputPredictorPipeline {
         buffer_to_file(weights.head2_bias, weights_dir + "/head2_conv1_bias.data");
         buffer_to_file(weights.conv1_filter, weights_dir + "/trunk_conv1_weight.data");
         buffer_to_file(weights.conv1_bias, weights_dir + "/trunk_conv1_bias.data");
-        buffer_to_file(weights.conv2_filter, weights_dir + "/trunk_conv2_weight.data");
-        buffer_to_file(weights.conv2_bias, weights_dir + "/trunk_conv2_bias.data");
-        buffer_to_file(weights.conv3_filter, weights_dir + "/trunk_conv3_weight.data");
-        buffer_to_file(weights.conv3_bias, weights_dir + "/trunk_conv3_bias.data");
-        buffer_to_file(weights.conv4_filter, weights_dir + "/trunk_conv4_weight.data");
-        buffer_to_file(weights.conv4_bias, weights_dir + "/trunk_conv4_bias.data");
-        buffer_to_file(weights.conv5_filter, weights_dir + "/trunk_conv5_weight.data");
-        buffer_to_file(weights.conv5_bias, weights_dir + "/trunk_conv5_bias.data");
-        buffer_to_file(weights.conv6_filter, weights_dir + "/trunk_conv6_weight.data");
-        buffer_to_file(weights.conv6_bias, weights_dir + "/trunk_conv6_bias.data");
     }
 
 
@@ -594,6 +456,9 @@ class ThroughputPredictorPipeline {
             internal_assert(sock >= 0) << "Socket creation error";
             fd = sock;
 
+            int option = 1;
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+
             serv_addr.sin_family = AF_INET;
             serv_addr.sin_port = htons(port);
 
@@ -602,7 +467,10 @@ class ThroughputPredictorPipeline {
             internal_assert(err == 0) << "Invalid address";
 
             err = connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
-            internal_assert(err == 0) << "Connection failed";
+            if (err != 0) {
+                perror("Error connecting to weights server");
+            }
+            internal_assert(err == 0) << "Connection failed\n";
         }
 
         void send(const uint8_t *data, ssize_t len) {
@@ -620,6 +488,7 @@ class ThroughputPredictorPipeline {
         }
 
         ~TCPConnection() {
+            shutdown(fd, SHUT_RDWR);
             close(fd);
         }
     };
@@ -632,16 +501,6 @@ class ThroughputPredictorPipeline {
         f(weights.head2_bias);
         f(weights.conv1_filter);
         f(weights.conv1_bias);
-        f(weights.conv2_filter);
-        f(weights.conv2_bias);
-        f(weights.conv3_filter);
-        f(weights.conv3_bias);
-        f(weights.conv4_filter);
-        f(weights.conv4_bias);
-        f(weights.conv5_filter);
-        f(weights.conv5_bias);
-        f(weights.conv6_filter);
-        f(weights.conv6_bias);
     }
 
     template<typename F>
@@ -655,20 +514,10 @@ class ThroughputPredictorPipeline {
         slice_and_call_f(head2_bias_update);
         slice_and_call_f(conv1_filter_update);
         slice_and_call_f(conv1_bias_update);
-        slice_and_call_f(conv2_filter_update);
-        slice_and_call_f(conv2_bias_update);
-        slice_and_call_f(conv3_filter_update);
-        slice_and_call_f(conv3_bias_update);
-        slice_and_call_f(conv4_filter_update);
-        slice_and_call_f(conv4_bias_update);
-        slice_and_call_f(conv5_filter_update);
-        slice_and_call_f(conv5_bias_update);
-        slice_and_call_f(conv6_filter_update);
-        slice_and_call_f(conv6_bias_update);
     }
 
     void send_weights_to_weights_server() {
-        debug(0) << "Sending weights to weights server...\n";
+        // debug(0) << "Sending weights to weights server...\n";
         auto conn = TCPConnection(weights_server_hostname, weights_server_port);
 
         ssize_t total_size_of_weights = 0;
@@ -682,11 +531,11 @@ class ThroughputPredictorPipeline {
         for_each_weight([&](const Runtime::Buffer<float> &w) {
                 conn.send((const uint8_t *)(w.data()), w.size_in_bytes());
             });
-        debug(0) << "Sent.\n";
+        // debug(0) << "Sent.\n";
     }
 
     void send_gradients_to_weights_server() {
-        debug(0) << "Sending gradients to weights server...\n";
+        // debug(0) << "Sending gradients to weights server...\n";
         auto conn = TCPConnection(weights_server_hostname, weights_server_port);
 
         ssize_t total_size_of_weights = 0;
@@ -700,11 +549,11 @@ class ThroughputPredictorPipeline {
         for_each_gradient([&](const Runtime::Buffer<float> &w) {
                 conn.send((const uint8_t *)(w.data()), w.size_in_bytes());
             });
-        debug(0) << "Sent.\n";
+        // debug(0) << "Sent.\n";
     }
 
     void get_weights_from_weights_server() {
-        debug(0) << "Getting weights from weights server...\n";
+        // debug(0) << "Getting weights from weights server...\n";
         auto conn = TCPConnection(weights_server_hostname, weights_server_port);
 
         ssize_t total_size_of_weights = 0;
@@ -718,7 +567,7 @@ class ThroughputPredictorPipeline {
         for_each_weight([&](Runtime::Buffer<float> &w) {
                 conn.recv((uint8_t *)(w.data()), w.size_in_bytes());
             });
-        debug(0) << "Received.\n";
+        // debug(0) << "Received.\n";
     }
 
     // Discard any enqueued but unevaluated schedules

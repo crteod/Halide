@@ -25,8 +25,10 @@
 #include <chrono>
 #include <iostream>
 #include <random>
+#include <unordered_map>
 #include <unordered_set>
 #include <fstream>
+#include <sstream>
 
 // TODO: overview of algorithm
 
@@ -440,6 +442,9 @@ struct FunctionDAG {
             // If true, the loop bounds are a constant with the given min and max
             bool bounds_are_constant = false;
             int64_t c_min = 0, c_max = 0;
+
+            // A persistent fragment of source for getting this Var from its owner Func.
+            string accessor;
         };
 
 
@@ -496,6 +501,9 @@ struct FunctionDAG {
 
             // The actual Halide front-end stage object
             Halide::Stage stage;
+
+            // The name for scheduling (e.g. "foo.update(3)")
+            string name;
 
             // Ids for perfect hashing on stages.
             int id, max_id;
@@ -717,6 +725,11 @@ struct FunctionDAG {
                 if (s > 0) halide_stage = Func(consumer).update(s-1);
                 Node::Stage stage(halide_stage);
                 stage.node = &node;
+                // stage.name = "get_func(" + std::to_string(i - 1) + ")";
+                stage.name = consumer.name();
+                if (s > 0) {
+                    stage.name += ".update(" + std::to_string(s - 1) + ")";
+                }
 
                 const Definition &def = (s == 0) ? consumer.definition() : consumer.update(s - 1);
                 const StageSchedule &sched = def.schedule();
@@ -781,12 +794,14 @@ struct FunctionDAG {
                 // We'll take any existing reordering, but won't handle existing splits
                 internal_assert(sched.splits().empty());
                 stage.loop_nest_all_common_cases = true;
-                for (const auto &d : sched.dims()) {
+                for (size_t i = 0; i < sched.dims().size(); i++) {
+                    const auto &d = sched.dims()[i];
                     // Skip synthetic loops like "__outermost"
                     if (!stage_scope_with_symbolic_rvar_bounds.contains(d.var)) continue;
 
                     Node::Loop l;
                     l.var = d.var;
+                    l.accessor = stage.name + ".get_schedule().dims()[" + std::to_string(i) + "].var";
 
                     // We already have the right variable names in the stage scope
                     Interval in = stage_scope_with_concrete_rvar_bounds.get(l.var);
@@ -2173,15 +2188,21 @@ struct LoopNest {
                     int64_t store_line_footprint = 1;
                     bool discontinuous = false;
 
-                    for (int i = 0; i < node->func.dimensions(); i++) {
+                    for (int i = 0; i < e->producer->func.dimensions(); i++) {
                         auto p = bounds->region_required(i);
                         auto compute_p = producer_compute_bounds->region_computed(i);
                         auto store_p = producer_store_bounds->region_required(i);
                         int64_t extent = p.second - p.first + 1;
                         int64_t compute_extent = compute_p.second - compute_p.first + 1;
                         int64_t store_extent = store_p.second - store_p.first + 1;
+                        internal_assert(!mul_would_overflow(64, footprint, extent))
+                            << footprint << " " << extent << "\n";
                         footprint *= extent;
+                        internal_assert(!mul_would_overflow(64, compute_footprint, compute_extent))
+                            << compute_footprint << " " << compute_extent << "\n";
                         compute_footprint *= compute_extent;
+                        internal_assert(!mul_would_overflow(64, store_footprint, store_extent))
+                            << store_footprint << " " << store_extent << "\n";
                         store_footprint *= store_extent;
                         if (discontinuous) {
                             line_footprint *= extent;
@@ -2234,6 +2255,7 @@ struct LoopNest {
             // Properties of the realization, but the values are
             // computable at the production site because that's where
             // the consumers are.
+            internal_assert(bytes_loaded >= 0) << "Negative bytes loaded: " << bytes_loaded << "\n";
             feat.unique_bytes_read_per_realization = bytes_loaded;
             feat.allocation_bytes_read_per_realization = allocation_bytes_loaded;
             feat.unique_lines_read_per_realization = lines_loaded;
@@ -2241,6 +2263,7 @@ struct LoopNest {
             if (!at_pure_production) {
                 // Also pessimistically assume this update definition relies on the entirety of the produced region so far.
                 // TODO: This overbills scatters, or writes to a restriction region.
+                internal_assert(bytes_loaded >= 0) << "Negative bytes at production: " << feat.bytes_at_production << "\n";
                 feat.unique_bytes_read_per_realization += feat.bytes_at_production;
                 feat.unique_lines_read_per_realization++; // It's accessed contiguously (TODO: This is fishy. Should probably be lines_at_production)
                 feat.allocation_bytes_read_per_realization += feat.bytes_at_production;
@@ -2523,7 +2546,7 @@ struct LoopNest {
 
         if ((!is_root() || f->is_output || !force_only_output_compute_root) &&
             !innermost &&
-            (!in_realization || size[vector_dim] == 1)) {
+            (!in_realization || size.empty() || size[vector_dim] == 1)) {
             // Place the computation inside this loop
             std::unique_ptr<LoopNest> r{new LoopNest};
             r->copy_from(*this);
@@ -2550,10 +2573,6 @@ struct LoopNest {
             }
 
             for (auto t : tilings) {
-                if (node->func.name() == "output") {
-                    internal_assert(t[2] != 2);
-                }
-
                 if (parent->is_root()) {
                     const auto &l = stage->loop;
                     // Skip root-level tilings that provide
@@ -2690,20 +2709,22 @@ struct LoopNest {
         return result;
     }
 
-    struct FuncVars {
+    struct StageScheduleState {
         double num_cores = 0; // How much parallelism do we need to exploit with this Func?
         struct FuncVar {
             VarOrRVar orig;
             VarOrRVar var;
+            string accessor;
             int64_t extent = 0;
             bool outermost = false, parallel = false, exists = false, pure = false;
             FuncVar() : orig(Var()), var(Var()) {}
         };
         vector<FuncVar> vars; // In order from innermost to outermost. Each group of d is one tiling.
+        std::ostringstream schedule_source;
     };
 
     void apply(LoopLevel here,
-               map<const FunctionDAG::Node::Stage *, FuncVars> &vars_map,
+               map<const FunctionDAG::Node::Stage *, StageScheduleState> &state_map,
                double num_cores,
                int depth,
                const LoopNest *parent,
@@ -2711,37 +2732,43 @@ struct LoopNest {
         if (is_root()) {
             for (auto &c : children) {
                 Func(c->node->func).compute_root();
-                c->apply(LoopLevel::root(), vars_map, num_cores, 1, this, c.get());
+                c->apply(LoopLevel::root(), state_map, num_cores, 1, this, c.get());
+                if (c->stage_idx == 0) {
+                    auto &state = state_map[c->stage];
+                    state.schedule_source << "\n    .compute_root()";
+                    // TODO: Omitting logic for printing store_root() assumes everything store_root is also compute root
+                }
             }
         } else {
             if (parent && parent->node != node) {
                 compute_site = this;
             }
 
-            auto it = vars_map.find(stage);
+            auto it = state_map.find(stage);
             const auto &symbolic_loop = stage->loop;
             const auto &parent_bounds = parent->get_bounds(node);
-            if (it == vars_map.end()) {
-                FuncVars vars;
-                vars.num_cores = num_cores;
+            if (it == state_map.end()) {
+                StageScheduleState state;
+                state.num_cores = num_cores;
                 for (size_t i = 0; i < symbolic_loop.size(); i++) {
-                    FuncVars::FuncVar fv;
+                    StageScheduleState::FuncVar fv;
                     const auto &l = symbolic_loop[i];
                     fv.var = VarOrRVar(l.var, !l.pure);
                     fv.orig = fv.var;
+                    fv.accessor = l.accessor;
                     const auto &p = parent_bounds->loops(stage_idx, i);
                     fv.extent = p.second - p.first + 1;
                     fv.outermost = true;
                     fv.parallel = parent->is_root() && l.pure;
                     fv.exists = true;
                     fv.pure = l.pure;
-                    vars.vars.push_back(fv);
+                    state.vars.push_back(fv);
                 }
-                vars_map[stage] = vars;
+                state_map.emplace(stage, std::move(state));
             }
-            auto &vars = vars_map[stage];
+            auto &state = state_map[stage];
 
-            debug(0) << "Scheduling " << node->func.name() << " stage " << stage_idx << '\n';
+            // The getter for grabbing Func handles is reverse topological order
             Stage s = Func(node->func);
             if (stage_idx > 0) {
                 s = Func(node->func).update(stage_idx - 1);
@@ -2760,6 +2787,7 @@ struct LoopNest {
                     // storage. Otherwise let the compiler pick heap
                     // or stack as it likes.
                     Func(node->func).store_in(MemoryType::Stack);
+                    state.schedule_source << "\n    .store_in(MemoryType::Stack)";
                 }
             }
 
@@ -2785,19 +2813,19 @@ struct LoopNest {
             if (!size.empty()) {
                 if (innermost) {
                     // Find the innermost var, and the innermost pure var
-                    FuncVars::FuncVar *innermost_var = nullptr, *innermost_pure_var = nullptr;
-                    internal_assert(vars.vars.size() >= symbolic_loop.size());
+                    StageScheduleState::FuncVar *innermost_var = nullptr, *innermost_pure_var = nullptr;
+                    internal_assert(state.vars.size() >= symbolic_loop.size());
                     int64_t product_of_pure_loops = 1;
                     for (size_t i = 0; i < symbolic_loop.size(); i++) {
-                        if (!vars.vars[i].exists) continue;
+                        if (!state.vars[i].exists) continue;
                         if (innermost_var == nullptr) {
-                            innermost_var = &vars.vars[i];
+                            innermost_var = &state.vars[i];
                         }
                         if (innermost_pure_var == nullptr && symbolic_loop[i].pure) {
-                            innermost_pure_var = &vars.vars[i];
+                            innermost_pure_var = &state.vars[i];
                         }
-                        if (vars.vars[i].pure) {
-                            product_of_pure_loops *= vars.vars[i].extent;
+                        if (state.vars[i].pure) {
+                            product_of_pure_loops *= state.vars[i].extent;
                         }
                     }
                     internal_assert(innermost_var);
@@ -2827,14 +2855,23 @@ struct LoopNest {
                             }
                             s.split(innermost_pure_var->var, innermost_pure_var->var, vec, split_factor, tail_strategy)
                                 .vectorize(vec);
-                            FuncVars::FuncVar v = *innermost_pure_var;
+                            state.schedule_source
+                                << "\n    .split("
+                                << innermost_pure_var->var.name() << ", "
+                                << innermost_pure_var->var.name() << ", "
+                                << vec.name() << ", "
+                                << split_factor << ", "
+                                << "TailStrategy::" << tail_strategy << ").vectorize("
+                                << vec.name() << ")";
+                            StageScheduleState::FuncVar v = *innermost_pure_var;
                             v.extent = split_factor;
                             v.var = vec;
+                            v.accessor.clear();
                             v.parallel = false;
                             v.outermost = false;
                             innermost_pure_var->extent += split_factor - 1;
                             innermost_pure_var->extent /= split_factor;
-                            vars.vars.insert(vars.vars.begin(), v);
+                            state.vars.insert(state.vars.begin(), v);
                             product_of_pure_loops /= split_factor;
                             vectorized = true;
                         }
@@ -2847,8 +2884,6 @@ struct LoopNest {
                     // constant.
                     bool all_pure_loops_constant_size = true;
 
-                    debug(0) << "Product of pure loops = " << product_of_pure_loops << "\n"
-                             << "All pure loops constant size = " << all_pure_loops_constant_size << "\n";
                     if (product_of_pure_loops <= 16 && all_pure_loops_constant_size) {
                         // There's a hope we can fit anything compute-at this level into registers if we fully unroll
                         // TODO: 16 should be the number of vector registers in the architecture
@@ -2856,14 +2891,15 @@ struct LoopNest {
                         // Start at 1 to skip the vectorized var
                         size_t start = vectorized ? 1 : 0;
                         size_t end = symbolic_loop.size() + start;
-                        std::stable_sort(vars.vars.begin() + start, vars.vars.begin() + end,
-                                         [](const FuncVars::FuncVar &a, const FuncVars::FuncVar &b) {
+                        std::stable_sort(state.vars.begin() + start, state.vars.begin() + end,
+                                         [](const StageScheduleState::FuncVar &a, const StageScheduleState::FuncVar &b) {
                                              return a.pure && !b.pure;
                                          });
 
                         for (size_t i = start; i < end; i++) {
-                            if (vars.vars[i].pure && vars.vars[i].exists) {
-                                s.unroll(vars.vars[i].var);
+                            if (state.vars[i].pure && state.vars[i].exists) {
+                                s.unroll(state.vars[i].var);
+                                state.schedule_source << "\n    .unroll(" << state.vars[i].var.name() << ")";
                             }
                         }
                     }
@@ -2872,10 +2908,10 @@ struct LoopNest {
 
                 } else {
                     // Do the implied splits
-                    vector<FuncVars::FuncVar> new_inner;
+                    vector<StageScheduleState::FuncVar> new_inner;
                     for (size_t i = 0; i < symbolic_loop.size(); i++) {
-                        FuncVars::FuncVar v;
-                        FuncVars::FuncVar &parent = vars.vars[i];
+                        StageScheduleState::FuncVar v;
+                        StageScheduleState::FuncVar &parent = state.vars[i];
                         int64_t factor = (parent.extent + size[i] - 1) / size[i];
                         if (!parent.exists || parent.extent == 1 || factor == 1) {
                             v.exists = false;
@@ -2887,29 +2923,28 @@ struct LoopNest {
                             parent.exists = false;
                             parent.extent = 1;
                         } else {
-                            VarOrRVar outer(Var(parent.var.name() + "o"));
                             VarOrRVar inner(Var(parent.var.name() + "i"));
                             if (parent.var.is_rvar) {
-                                outer = RVar(parent.var.name() + "o");
                                 inner = RVar(parent.var.name() + "i");
                             }
+
                             auto tail_strategy = pure_var_tail_strategy;
                             // If it's an RVar, or not the outermost split and we're in an update, we need a guard with if instead.
                             if (parent.var.is_rvar || (stage_idx != 0 && !parent.outermost)) {
                                 tail_strategy = TailStrategy::GuardWithIf;
                             }
-                            debug(0) << "Splitting " << node->func.name()
-                                     << ".s" << stage_idx
-                                     << "." << parent.var.name()
-                                     << " = " << outer.name()
-                                     << " * " << factor
-                                     << " + " << inner.name()
-                                     << " using " << tail_strategy << "\n";
-                            s.split(parent.var, outer, inner, (int)factor, tail_strategy);
+                            s.split(parent.var, parent.var, inner, (int)factor, tail_strategy);
+                            state.schedule_source
+                                << "\n    .split("
+                                << parent.var.name() << ", "
+                                << parent.var.name() << ", "
+                                << inner.name() << ", "
+                                << factor << ", "
+                                << "TailStrategy::" << tail_strategy << ")";
                             v = parent;
-                            parent.var = outer;
                             parent.extent = size[i];
                             v.var = inner;
+                            v.accessor.clear();
                             v.extent = factor;
                             v.parallel = false;
                             v.outermost = false;
@@ -2917,14 +2952,14 @@ struct LoopNest {
                         new_inner.push_back(v);
                     }
                     bool found = false;
-                    for (const auto &v : vars.vars) {
+                    for (const auto &v : state.vars) {
                         if (!v.exists) continue;
                         here = LoopLevel(node->func, v.var);
                         found = true;
                         break;
                     }
                     internal_assert(found) << "Could not find appropriate compute_at location for children of " << node->func.name() << "\n";
-                    vars.vars.insert(vars.vars.begin(), new_inner.begin(), new_inner.end());
+                    state.vars.insert(state.vars.begin(), new_inner.begin(), new_inner.end());
                 }
             }
             for (auto f : store_at) {
@@ -2933,12 +2968,35 @@ struct LoopNest {
             for (auto s : size) {
                 num_cores /= s;
             }
+            here.lock();
+            string loop_level;
+            if (here.is_root()) {
+                loop_level = "_root()";
+            } else {
+                loop_level = "_at(" + here.func() + ", " + here.var().name() + ")";
+            }
             for (auto &c : children) {
                 if (c->node != node) {
-                    debug(0) << "Compute_at: " << c->node->func.name() << " " << here.lock().to_string() << "\n";
                     Func(c->node->func).compute_at(here);
                 }
-                c->apply(here, vars_map, num_cores, depth + 1, this, compute_site);
+                c->apply(here, state_map, num_cores, depth + 1, this, compute_site);
+                if (c->node != node && c->stage_idx == 0) {
+                    auto &state = state_map[c->stage];
+                    state.schedule_source << "\n    .compute" << loop_level;
+                }
+            }
+            for (auto f : store_at) {
+                bool computed_here = false;
+                for (auto &c : children) {
+                    if (c->node == f) {
+                        computed_here = true;
+                        break;
+                    }
+                }
+                if (!computed_here) {
+                    auto &state = state_map[&(f->stages[0])];
+                    state.schedule_source << "\n    .store" << loop_level;
+                }
             }
         }
     }
@@ -3018,13 +3076,21 @@ struct State {
 
         cost = 0;
 
+        if (verbose) {
+            for (auto it = features.begin(); it != features.end(); it++) {
+                auto &stage = *(it.key());
+                const auto &feat = it.value();
+                debug(0) << "Schedule features for " << stage.stage.name() << "\n";
+                feat.dump();
+            }
+        }
+
         // use either deep network or linear model to predict cost
         if (throughput_predictor) {
 
             // Perform any quick rejection tests before enqueuing this
 
             // TODO: allow massive recompute for stages that are no more expensive than a load from them
-            /*
             for (auto it = features.begin(); it != features.end(); it++) {
                 auto &feat = it.value();
                 if (feat.points_computed_total + feat.inlined_calls > 10 * feat.points_computed_minimum) {
@@ -3032,8 +3098,7 @@ struct State {
                     return true;
                 }
             }
-            */
-            
+
             // Avoid code size explosion from recursive inlining.
             if (root->max_inlined_calls() > 100) {
                 cost = 1e50;
@@ -3077,12 +3142,6 @@ struct State {
                 // doing more than 10x redundant recompute for any one
                 // stage.
                 //if (feat.points_computed_total + feat.inlined_calls > 10*feat.points_computed_minimum) return false;
-
-                if (verbose) {
-                    debug(0) << "Schedule features for " << stage.stage.name() << "\n";
-                    feat.dump();
-                }
-
 
                 double compute_cost = 0;
                 const int *pipeline_feat = (const int *)(&stage.features.op_histogram[0][0]);
@@ -3329,13 +3388,63 @@ struct State {
     void dump() const {
         debug(0) << "State with cost " << cost << ":\n";
         root->dump("");
+        debug(0) << schedule_source;
     }
 
-    void apply_schedule(const MachineParams &params) {
-        map<const FunctionDAG::Node::Stage *, LoopNest::FuncVars> vars_map;
-        root->apply(LoopLevel::root(), vars_map, params.parallelism, 0, nullptr, nullptr);
+    string schedule_source;
 
-        for (auto &p : vars_map) {
+    void apply_schedule(const FunctionDAG &dag, const MachineParams &params) {
+        map<const FunctionDAG::Node::Stage *, LoopNest::StageScheduleState> state_map;
+        root->apply(LoopLevel::root(), state_map, params.parallelism, 0, nullptr, nullptr);
+
+        std::ostringstream src;
+
+        // Print handles for all the Funcs
+        int i = (int)(dag.nodes.size() - 1);
+        for (const auto &n : dag.nodes) {
+            src << "Func " << n.func.name() << " = get_pipeline().get_func(" << i << ");\n";
+            i--;
+        }
+
+        // Gather all Vars and RVars so that we can declare them in the emitted source
+        map<string, string> vars, rvars;
+        for (auto &p : state_map) {
+            for (auto &v : p.second.vars) {
+                if (v.exists) {
+                    if (v.var.is_rvar) {
+                        rvars.emplace(v.var.name(), v.accessor);
+                    } else {
+                        vars.emplace(v.var.name(), v.accessor);
+                    }
+                }
+            }
+        }
+        if (!vars.empty()) {
+            string prefix = "Var ";
+            for (const auto &p : vars) {
+                if (p.second.empty()) {
+                    src << prefix << p.first << "(\"" << p.first << "\")";
+                } else {
+                    src << prefix << p.first << "(" << p.second << ")";
+                }
+                prefix = ", ";
+            }
+            src << ";\n";
+        }
+        if (!rvars.empty()) {
+            string prefix = "RVar ";
+            for (const auto &p : rvars) {
+                if (p.second.empty()) {
+                    src << prefix << p.first << "(\"" << p.first << "\")";
+                } else {
+                    src << prefix << p.first << "(" << p.second << ")";
+                }
+                prefix = ", ";
+            }
+            src << ";\n";
+        }
+
+        for (auto &p : state_map) {
             Stage stage(p.first->stage);
 
             // Do all the reorders and pick which vars to
@@ -3346,17 +3455,39 @@ struct State {
                 if (!it->exists) continue;
                 if (!it->parallel) break;
                 parallel_tasks *= it->extent;
+                p.second.schedule_source << "\n    .parallel(" << it->var.name() << ")";
                 stage.parallel(it->var);
                 // Stop at a sufficient number of tasks (TODO: Make this a tiling level in the search space instead).
                 if (parallel_tasks > params.parallelism * 8) break;
             }
 
-            for (auto &v : p.second.vars) {
-                if (v.exists) {
-                    vars.push_back(v.var);
+            if (p.second.vars.size() > 1) {
+                p.second.schedule_source << "\n    .reorder(";
+                bool first = true;
+                for (auto &v : p.second.vars) {
+                    if (v.exists) {
+                        vars.push_back(v.var);
+                        if (!first) {
+                            p.second.schedule_source << ", ";
+                        }
+                        first = false;
+                        p.second.schedule_source << v.var.name();
+                    }
                 }
+                p.second.schedule_source << ")";
+                stage.reorder(vars);
             }
-            stage.reorder(vars);
+
+            // Dump the schedule source string
+            src << p.first->name
+                << p.second.schedule_source.str()
+                << ";\n";
+        }
+        schedule_source = src.str();
+        bool in_quotes = false;
+        for (auto &c : schedule_source) {
+            in_quotes ^= (c == '"');
+            if (!in_quotes && c == '$') c = '_';
         }
     }
 };
@@ -3475,6 +3606,7 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
                                           std::unordered_set<uint64_t> &permitted_hashes) {
 
     if (throughput_predictor) {
+        throughput_predictor->set_num_cores(params.parallelism);
         configure_pipeline_features(dag, throughput_predictor);
     }
 
@@ -3751,13 +3883,15 @@ std::string generate_schedules_new(const std::vector<Function> &outputs,
     debug(0) << "Cost evaluated this many times: " << State::cost_calculations << '\n';
 
     debug(0) << "** Optimal schedule:\n";
-    optimal->dump();
 
     // Just to get the debugging prints to fire
     optimal->calculate_cost(dag, params, tp, true);
 
     // Apply the schedules
-    optimal->apply_schedule(params);
+    optimal->apply_schedule(dag, params);
+
+    // Print out the schedule
+    optimal->dump();
 
     // Print out the predicted runtime of each Func, so we can compare them to a profile
     // optimal->print_predicted_runtimes(params);
@@ -3790,10 +3924,11 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
         map<string, Function> env;
         Pipeline p;
         float misprediction;
+        uint64_t hash;
     };
 
-    const int max_history = 512;
-    const int batch_size = 64;
+    const int max_history = 800;
+    const int batch_size = 8;
     vector<std::shared_ptr<Trial>> history;
     Runtime::Buffer<float> runtimes(max_history);
 
@@ -3809,11 +3944,16 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
     // Use a thread pool for compilation jobs. LLVM is slow.
     ThreadPool<void> thread_pool;
 
-    float learning_rate = 0.001f;
+    float learning_rate = 0.0001f;
 
     size_t best_of_all_time = 0;
 
-    int exploration_dropout = 50;
+    int exploration_dropout = 95;
+
+    Tools::BenchmarkConfig config;
+    config.min_time = 0.2;
+    config.max_time = 2.0;
+    config.accuracy = 0.02;
 
     for (int iter = 0;; iter++) {
 
@@ -3835,8 +3975,30 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
             // Autoschedule it
             std::unique_ptr<FunctionDAG> dag { new FunctionDAG {outputs, params, target} };
             std::shared_ptr<Trial> t { new Trial {std::move(dag), nullptr, outputs, local_env, Pipeline{}, 0.0f} };
-            t->optimal = optimal_schedule(*(t->dag), outputs, params, &tp, bs);
-            t->optimal->apply_schedule(params);
+            bool unique = false;
+            while (!unique) {
+                t->optimal = optimal_schedule(*(t->dag), outputs, params, &tp, bs);
+                if (t->optimal->cost >= 1e50) {
+                    // We're starting to include crazy stuff - get more conservative
+                    if (exploration_dropout < 99) exploration_dropout++;
+                    continue;
+                }
+                t->hash = t->optimal->structural_hash(0x7fffffff, params.parallelism);
+
+                // Make sure this hash isn't already in the history
+                unique = true;
+                if (b > 0) {
+                    for (size_t i = 0; i < history.size(); i++) {
+                        if (history[i]->hash == t->hash) {
+                            unique = false;
+                            // We're starting to repeat stuff, increase diversity
+                            if (exploration_dropout > 50) exploration_dropout--;
+                            break;
+                        }
+                    }
+                }
+            }
+            t->optimal->apply_schedule(*dag, params);
             history.emplace_back(std::move(t));
         }
 
@@ -3846,10 +4008,11 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
             debug(0) << "Compiling batch member " << b << "\n";
             internal_assert(batch_start + b < history.size());
             Trial *t = history[batch_start + b].get();
-            internal_assert(t->outputs.size() == 1) << "Multiple outputs not yet supported\n";
-            Function o = t->outputs[0];
-            t->p = Pipeline(Func(o));
-            internal_assert(o.output_types().size() == 1) << "Tuple outputs not yet supported\n";
+            vector<Func> outputs;
+            for (Function o : t->outputs) {
+                outputs.push_back(Func(o));
+            }
+            t->p = Pipeline(outputs);
             // TODO: We'd like to use the target here, but that
             // triggers recompilation in infer_input_bounds when the
             // target doesn't match the jit target.
@@ -3874,30 +4037,34 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
             debug(0) << "Benchmarking batch member " << b << "\n";
             internal_assert(batch_start + b < history.size());
             Trial *t = history[batch_start + b].get();
-            Function o = t->outputs[0];
-
-            // Make output buffers and run
-            vector<int> sz;
-            sz.resize(o.dimensions());
-            for (const auto &b : o.schedule().estimates()) {
-                int dim = 0;
-                for (dim = 0; dim < o.dimensions(); dim++) {
-                    if (o.args()[dim] == b.var) break;
+            vector<Buffer<>> output_buffers;
+            for (Function o : t->outputs) {
+                // Make output buffers and run
+                vector<int> sz;
+                sz.resize(o.dimensions());
+                for (const auto &b : o.schedule().estimates()) {
+                    int dim = 0;
+                    for (dim = 0; dim < o.dimensions(); dim++) {
+                        if (o.args()[dim] == b.var) break;
+                    }
+                    internal_assert(dim < o.dimensions());
+                    const int64_t *sz_ptr = as_const_int(b.extent);
+                    sz[dim] = *sz_ptr;
                 }
-                internal_assert(dim < o.dimensions());
-                const int64_t *sz_ptr = as_const_int(b.extent);
-                sz[dim] = *sz_ptr;
+                for (auto t : o.output_types()) {
+                    output_buffers.emplace_back(t, sz);
+                }
             }
+            Realization r(output_buffers);
 
-            Runtime::Buffer<> buf(o.output_types()[0], sz);
             // Make some input buffers
-            t->p.infer_input_bounds(buf);
+            t->p.infer_input_bounds(r);
             t->p.set_error_handler(autotuner_error_handler);
 
             // Benchmark it
             autotuner_errored = false;
             size_t c = batch_start + b;
-            double ms = 1e3 * Tools::benchmark(3, 3, [&]() {t->p.realize(buf);});
+            double ms = 1e3 * Tools::benchmark([&]() {t->p.realize(r);}, config);
             if (autotuner_errored) {
                 internal_assert(!history.empty()) << "The very first run errored out\n";
                 runtimes(c) = runtimes(0);
@@ -3944,10 +4111,17 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
         }
 
         // Then run the predictor in training mode once we have enough samples
-        if (history.size() >= max_history / 2) {
-            for (int i = 0; i < 10; i++) {
+        if (1) { //history.size() >= max_history / 2) {
+            // Iterate until we can model the current set of runtimes to within 20% of the fastest one
+            for (int i = 0; i < 1000; i++) {
                 float loss = tp.backprop(runtimes.cropped(0, 0, history.size()), learning_rate);
-                debug(0) << "RMS Loss: " << std::sqrt(loss) << "\n";
+                if (i % 100 == 0) {
+                    debug(0) << "RMS misprediction: " << loss << "\n";
+                }
+                if (i > 100 && loss < runtimes(best_of_all_time) / 5.0) {
+                    debug(0) << "Final RMS misprediction: " << loss << "\n";
+                    break;
+                }
             }
             tp.save_weights();
         }
@@ -4082,7 +4256,7 @@ void autoschedule_test() {
         optimal->dump();
         debug(0) << '\n';
 
-        optimal->apply_schedule(params);
+        optimal->apply_schedule(dag, params);
         // h.realize(1000, 1000);
 
     }
@@ -4117,7 +4291,7 @@ void autoschedule_test() {
         optimal->dump();
         debug(0) << '\n';
 
-        optimal->apply_schedule(params);
+        optimal->apply_schedule(dag, params);
         // h.realize(1000, 1000);
     }
 
@@ -4142,7 +4316,7 @@ void autoschedule_test() {
         optimal->dump();
         debug(0) << '\n';
 
-        optimal->apply_schedule(params);
+        optimal->apply_schedule(dag, params);
         // h.realize(2048, 2048);
     }
 
@@ -4166,7 +4340,7 @@ void autoschedule_test() {
         optimal->dump();
         debug(0) << '\n';
 
-        optimal->apply_schedule(params);
+        optimal->apply_schedule(dag, params);
         // h.realize(2048, 2048);
 
         // optimal->print_predicted_runtimes(dag, params);
@@ -4196,7 +4370,7 @@ void autoschedule_test() {
         optimal->dump();
         debug(0) << '\n';
 
-        // optimal->apply_schedule(params);
+        // optimal->apply_schedule(dag, params);
         // f[N-1].realize(2048, 2048);
     }
 

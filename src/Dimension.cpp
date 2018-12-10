@@ -47,11 +47,19 @@ Expr Dimension::stride() const {
 
 Dimension Dimension::set_extent(Expr extent) {
     param.set_extent_constraint(d, extent);
+    // Propagate constant bounds into estimates as well.
+    if (is_const(extent)) {
+        param.set_extent_constraint_estimate(d, extent);
+    }
     return *this;
 }
 
 Dimension Dimension::set_min(Expr min) {
     param.set_min_constraint(d, min);
+    // Propagate constant bounds into estimates as well.
+    if (is_const(min)) {
+        param.set_min_constraint_estimate(d, min);
+    }
     return *this;
 }
 
@@ -61,7 +69,7 @@ Dimension Dimension::set_stride(Expr stride) {
 }
 
 Dimension Dimension::set_bounds(Expr min, Expr extent) {
-    return set_min(min).set_extent(extent);
+    return set_min(min).set_extent(extent).set_bounds_estimate(min, extent);
 }
 
 Dimension Dimension::set_bounds_estimate(Expr min, Expr extent) {
