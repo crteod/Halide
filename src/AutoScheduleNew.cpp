@@ -2929,7 +2929,7 @@ struct State {
     mutable RefCount ref_count;
     IntrusivePtr<const LoopNest> root;
     IntrusivePtr<const State> parent;
-    double cost = 0;
+    mutable double cost = 0;
     int num_funcs_scheduled = 0;
     bool penalized = false;
 
@@ -2942,7 +2942,7 @@ struct State {
         return h;
     }
 
-    bool calculate_cost(const FunctionDAG &dag, const MachineParams &params, ThroughputPredictorPipeline *throughput_predictor,  bool verbose = false) {
+    bool calculate_cost(const FunctionDAG &dag, const MachineParams &params, ThroughputPredictorPipeline *throughput_predictor,  bool verbose = false) const {
         NodeMap<const LoopNest *> compute_site, store_site;
         compute_site.make_large(dag.nodes.size());
         store_site.make_large(dag.nodes.size());
@@ -3298,7 +3298,7 @@ struct State {
         root->dump("");
     }
 
-    void apply_schedule(const MachineParams &params) {
+    void apply_schedule(const MachineParams &params) const {
         map<const FunctionDAG::Node::Stage *, LoopNest::FuncVars> vars_map;
         root->apply(LoopLevel::root(), vars_map, params.parallelism, 0, nullptr, nullptr);
 
@@ -3433,7 +3433,7 @@ void configure_pipeline_features(const FunctionDAG &dag,
     throughput_predictor->set_pipeline_features(pipeline_features);
 }
 
-IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
+IntrusivePtr<const State> optimal_schedule_pass(FunctionDAG &dag,
                                           vector<Function> outputs,
                                           const MachineParams &params,
                                           ThroughputPredictorPipeline *throughput_predictor,
@@ -3617,7 +3617,7 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
             const bool has_grandparent = expandable_choices[0]->parent.defined() && expandable_choices[0]->parent->parent.defined();
 
             IntrusivePtr<const State> grandparent_state;
-            IntrusivePtr<State> state_selected;
+            IntrusivePtr<const State> state_selected;
 
             debug(0) << "\n--------------------\n";
 
@@ -3653,11 +3653,10 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
             if (!selection) {
                 // Go back to parent of previous choices
                 internal_assert(has_grandparent);
-                // TODO: avoid const_cast?
-                state_selected = const_cast<State*>(grandparent_state.get());
+                state_selected = grandparent_state;
                 i = i - 2;
             } else {
-                state_selected = expandable_choices[selection - 1];
+                state_selected = expandable_choices[selection - 1].get();
             }
 
             // Print the option that was selected back to user
@@ -3678,7 +3677,7 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
             // Generate children for all expandable choices
             for (auto choice : expandable_choices) {
                 if (choice->num_funcs_scheduled == (int) dag.nodes.size()) {
-                    return choice;
+                    return choice.get();
                 }
 
                 choice->generate_children(dag, params, throughput_predictor, enqueue_new_children);
@@ -3693,13 +3692,13 @@ IntrusivePtr<State> optimal_schedule_pass(FunctionDAG &dag,
     }
 }
 
-IntrusivePtr<State> optimal_schedule(FunctionDAG &dag,
+IntrusivePtr<const State> optimal_schedule(FunctionDAG &dag,
                                      vector<Function> outputs,
                                      const MachineParams &params,
                                      ThroughputPredictorPipeline *throughput_predictor,
                                      int beam_size) {
 
-    IntrusivePtr<State> best;
+    IntrusivePtr<const State> best;
 
     std::unordered_set<uint64_t> permitted_hashes;
     string cyos_str = get_env_variable("HL_CYOS");
@@ -3754,7 +3753,7 @@ std::string generate_schedules_new(const std::vector<Function> &outputs,
         tp = nullptr;
     }
 
-    IntrusivePtr<State> optimal;
+    IntrusivePtr<const State> optimal;
 
     if (time_limit) {
         // Use a fixed running time
@@ -3808,7 +3807,7 @@ std::string generate_schedules_autotune(const std::vector<Function> &output_func
 
     struct Trial {
         std::unique_ptr<FunctionDAG> dag;
-        IntrusivePtr<State> optimal;
+        IntrusivePtr<const State> optimal;
         vector<Function> outputs;
         map<string, Function> env;
         Pipeline p;
